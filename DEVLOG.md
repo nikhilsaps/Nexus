@@ -14,6 +14,7 @@ Last updated: 2026-10-12.
 | Wi-Fi: Scan | done, verified |
 | Wi-Fi: Connect + internet (HTTP-204) test | done, verified |
 | Wi-Fi: live RSSI signal meter | done (on the connect status screen) |
+| Die-temperature readout in status bar | done (toggle + 2/5/10/30/60s rate, NVS-saved) |
 | Wi-Fi: NTP clock sync | done |
 | Wi-Fi: Hotspot (SoftAP) | done |
 | Wi-Fi: Captive portal (DNS + HTTP, page from `/captive`) | done |
@@ -54,7 +55,8 @@ NEXUS (root)
   USB       -> Control (Keyboard/Mouse/Gamepad), Duck
   Storage   -> Browse, Card Info, Refresh
   WiFi      -> Scan, Hotspot, Captive, Free Heap
-  Settings  -> Logging, Animation, About
+  Settings  -> Logging, Animation, Temp Bar (on/off),
+               Temp Rate (2/5/10/30/60 s), About
 ```
 
 ## SD card layout (user-provided)

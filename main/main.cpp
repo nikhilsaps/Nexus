@@ -5,6 +5,7 @@
 #include <freertos/task.h>
 #include <driver/gpio.h>
 #include <esp_adc/adc_oneshot.h>
+#include <driver/temperature_sensor.h>
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <esp_log.h>
@@ -157,7 +158,7 @@ static int g_wifi_pct  = 0;   // 0 = not in use (icon hidden) until WiFi lands
 #define NEXUS_PIN "123456"   // fixed pairing passkey (mirrors esp_hid_gap.c)
 
 // ---------- Menu model ----------
-enum ItemKind { KIND_SUBMENU, KIND_ACTION, KIND_TOGGLE, KIND_INFO };
+enum ItemKind { KIND_SUBMENU, KIND_ACTION, KIND_TOGGLE, KIND_INFO, KIND_CYCLE };
 struct Menu;
 struct MenuItem {
   const char* label;
@@ -166,6 +167,7 @@ struct MenuItem {
   void      (*action)();
   bool*       flag;
   void      (*on_toggle)(bool);
+  int*        ival;
 };
 struct Menu {
   const char* title;
@@ -198,6 +200,20 @@ static void hid_pad(uint16_t b, int8_t x, int8_t y) {
 
 static bool g_log_on  = false;
 static bool g_anim_on = true;
+static int  g_temp_c   = 0;       // last die temperature, Celsius
+static bool g_temp_on  = true;    // show temp in the status bar
+static int  g_temp_sec = 5;       // sample interval, seconds
+static temperature_sensor_handle_t g_tsens = NULL;
+static void temp_init() {
+  temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 110);
+  if (temperature_sensor_install(&cfg, &g_tsens) == ESP_OK)
+    temperature_sensor_enable(g_tsens);
+}
+static void temp_sample() {
+  if (!g_tsens) return;
+  float t = 0;
+  if (temperature_sensor_get_celsius(g_tsens, &t) == ESP_OK) g_temp_c = (int)(t + 0.5f);
+}
 
 static Menu* g_stack[8];
 static int   g_depth = 0;
@@ -334,6 +350,10 @@ static void nvs_load() {
     if (nvs_get_u8(h, "log", &v) == ESP_OK) g_log_on = v;
     v = 1;
     if (nvs_get_u8(h, "anim", &v) == ESP_OK) g_anim_on = v;
+    v = 1;
+    if (nvs_get_u8(h, "tempon", &v) == ESP_OK) g_temp_on = v;
+    uint8_t ts = 5;
+    if (nvs_get_u8(h, "tempsec", &ts) == ESP_OK) g_temp_sec = ts;
     nvs_close(h);
   }
   apply_log();
@@ -343,12 +363,23 @@ static void nvs_save() {
   if (nvs_open("nexus", NVS_READWRITE, &h) == ESP_OK) {
     nvs_set_u8(h, "log", g_log_on ? 1 : 0);
     nvs_set_u8(h, "anim", g_anim_on ? 1 : 0);
+    nvs_set_u8(h, "tempon", g_temp_on ? 1 : 0);
+    nvs_set_u8(h, "tempsec", (uint8_t)g_temp_sec);
     nvs_commit(h);
     nvs_close(h);
   }
 }
 static void on_log_toggle(bool v)  { apply_log(); nvs_save(); }
 static void on_anim_toggle(bool v) { nvs_save(); }
+static void on_temp_toggle(bool v) { nvs_save(); }
+static void act_temp_rate() {
+  static const int steps[] = { 2, 5, 10, 30, 60 };
+  int n = sizeof(steps) / sizeof(steps[0]);
+  int i = 0; for (; i < n; i++) if (steps[i] == g_temp_sec) break;
+  i = (i + 1 >= n) ? 0 : i + 1;
+  g_temp_sec = steps[i];
+  nvs_save();
+}
 
 // ---------- Actions ----------
 static void show_msg(const char* t, const char* b) { g_msg_title = t; g_msg_body = b; g_view = VIEW_MSG; }
@@ -456,9 +487,11 @@ static Menu ble_menu = { "BLE", ble_items, 4, 0, 0 };
 static MenuItem set_items[] = {
   { "Logging",   KIND_TOGGLE, 0, 0, &g_log_on,  on_log_toggle },
   { "Animation", KIND_TOGGLE, 0, 0, &g_anim_on, on_anim_toggle },
+  { "Temp Bar",  KIND_TOGGLE, 0, 0, &g_temp_on, on_temp_toggle },
+  { "Temp Rate", KIND_CYCLE,  0, act_temp_rate, 0, 0, &g_temp_sec },
   { "About",     KIND_ACTION, 0, act_about, 0, 0 },
 };
-static Menu set_menu = { "SETTINGS", set_items, 3, 0, 0 };
+static Menu set_menu = { "SETTINGS", set_items, 5, 0, 0 };
 
 // USB mirrors BLE: USB > Control > Keyboard / Mouse / Gamepad (native USB HID).
 static MenuItem usb_control_items[] = {
@@ -557,6 +590,18 @@ static void draw_statusbar(const char* title) {
     rx -= 9;
   }
   rx -= 8;
+  // die temperature
+  if (g_temp_on) {
+    char ts[8];
+    snprintf(ts, sizeof(ts), "%dC", g_temp_c);
+    uint16_t tc = (g_temp_c >= 70) ? C_RED : (g_temp_c >= 50) ? C_AMBER : C_DIM;
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextColor(tc, C_BG);
+    canvas.setTextDatum(textdatum_t::top_right);
+    canvas.drawString(ts, rx, 1);
+    rx -= canvas.textWidth(ts);
+    rx -= 8;
+  }
   // Bluetooth
   if (g_ble_state > 0) {
     icon_bt(rx - 3, 2, 13, g_ble_state == 2);
@@ -600,6 +645,8 @@ static void draw_menu(Menu* m, float accent_y) {
     char buf[48];
     if (it->kind == KIND_TOGGLE) {
       snprintf(buf, sizeof(buf), "%s: %s", it->label, (*it->flag) ? "ON" : "OFF");
+    } else if (it->kind == KIND_CYCLE) {
+      snprintf(buf, sizeof(buf), "%s: %ds", it->label, it->ival ? *it->ival : 0);
     } else {
       snprintf(buf, sizeof(buf), "%s", it->label);
     }
@@ -897,6 +944,9 @@ static void enter_item(Menu* m) {
         *it->flag = !*it->flag;
         if (it->on_toggle) it->on_toggle(*it->flag);
       }
+      break;
+    case KIND_CYCLE:
+      if (it->action) it->action();
       break;
     default: break;
   }
@@ -2052,8 +2102,11 @@ extern "C" void app_main(void) {
   g_stack[0] = &root_menu;
   g_depth = 0;
 
+  temp_init();
+  temp_sample();
   batt_sample();
   uint32_t last_batt = xTaskGetTickCount();
+  uint32_t last_temp = last_batt;
   draw_menu(cur(), (float)cur()->sel);
 
   while (true) {
@@ -2065,6 +2118,12 @@ extern "C" void app_main(void) {
       last_batt = now;
       batt_tick = true;
     }
+    bool temp_tick = false;
+    if (g_temp_on && now - last_temp >= pdMS_TO_TICKS(g_temp_sec * 1000)) {
+      temp_sample();
+      last_temp = now;
+      temp_tick = true;
+    }
     int new_ble = bhid_active() ? (bhid_connected() ? 2 : 1) : 0;
     bool ble_changed = (new_ble != g_ble_state);
     g_ble_state = new_ble;
@@ -2075,7 +2134,7 @@ extern "C" void app_main(void) {
     switch (g_view) {
       case VIEW_MENU: {
         char k = kb_poll();
-        bool dirty = batt_tick || ble_changed || usb_changed;
+        bool dirty = batt_tick || temp_tick || ble_changed || usb_changed;
         if (k) {
           Menu* m = cur();
           switch (k) {

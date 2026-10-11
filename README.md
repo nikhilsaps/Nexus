@@ -47,8 +47,11 @@ The whole UI is driven from the Cardputer keyboard:
 | `,` | back |
 | `` ` `` | jump to root / exit a screen |
 
-The always-on status bar shows battery (with charge bolt + low warning), and the
-active transport: a BLE icon (dim = advertising, cyan = connected) or a USB label.
+The always-on status bar shows battery (with charge bolt + low warning), the
+die temperature (color-coded: dim under 50 C, amber 50-70, red above 70), and
+the active transport: a BLE icon (dim = advertising, cyan = connected) or a USB
+label. The temperature readout is toggleable and its sample rate is selectable
+(2 / 5 / 10 / 30 / 60 s) under Settings.
 
 ---
 
