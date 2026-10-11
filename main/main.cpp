@@ -10,8 +10,12 @@
 #include <esp_log.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <strings.h>
 #include "ble_hid.h"
 #include "usb_hid.h"
+#include "sd_store.h"
 
 // ---------- Palette (cyberdeck terminal) ----------
 static M5GFX display;
@@ -171,7 +175,8 @@ struct Menu {
 };
 
 // ---------- App views ----------
-enum AppView { VIEW_MENU, VIEW_MSG, VIEW_KB, VIEW_MOUSE, VIEW_PAD };
+enum AppView { VIEW_MENU, VIEW_MSG, VIEW_KB, VIEW_MOUSE, VIEW_PAD, VIEW_FILES,
+                VIEW_FILEACT, VIEW_TEXTIN, VIEW_CONFIRM, VIEW_DUCK, VIEW_DUCKRUN };
 static AppView g_view = VIEW_MENU;
 
 // ---------- Transport (BLE vs USB) ----------
@@ -218,6 +223,66 @@ static int8_t  g_pad_x = 0, g_pad_y = 0;
 static bool    g_prev_exit = false;
 static char    g_prev_held[8] = {0};
 static int     g_prev_n = 0;
+
+// ---------- Storage (microSD) screen state ----------
+static char        g_path[256]       = "/";
+static sd_entry_t* g_entries         = 0;      // heap, lazily allocated
+static int         g_entry_count     = 0;
+static int         g_file_sel        = 0;
+static int         g_file_top        = 0;
+static bool        g_entries_trunc   = false;
+static bool        g_sd_ok           = false;
+static char        g_sd_info_buf[200];
+
+// ---------- Storage write-op state ----------
+#define A_OPEN     1
+#define A_RENAME   2
+#define A_DELETE   3
+#define A_NEWFILE  4
+#define A_NEWDIR   5
+#define TIN_RENAME  1
+#define TIN_NEWFILE 2
+#define TIN_NEWDIR  3
+static const char* g_act_labels[6];
+static int         g_act_codes[6];
+static int         g_act_n   = 0;
+static int         g_act_sel = 0;
+static char        g_tin[SD_NAME_MAX];
+static int         g_tin_len  = 0;
+static int         g_tin_mode = 0;
+static char        g_rename_old[SD_NAME_MAX];
+static char        g_del_name[SD_NAME_MAX];
+static bool        g_del_isdir = false;
+
+// Build a card-relative path for `name` inside the current g_path.
+static void entry_rel(const char* name, char* out, size_t n) {
+  size_t pl = strlen(g_path);
+  if (pl && g_path[pl - 1] == '/') snprintf(out, n, "%s%s", g_path, name);
+  else                             snprintf(out, n, "%s/%s", g_path, name);
+}
+
+static void open_actions();
+static void do_action(int code);
+static void commit_text();
+
+// Human-readable byte count: "931", "4.3K", "12M", "7.4G".
+static void fmt_size(uint64_t b, char* out, size_t n) {
+  if (b < 1024ULL)              { snprintf(out, n, "%u",   (unsigned)b); return; }
+  if (b < 1024ULL*1024)         { snprintf(out, n, "%.1fK", b/1024.0);          return; }
+  if (b < 1024ULL*1024*1024)    { snprintf(out, n, "%.1fM", b/(1024.0*1024));   return; }
+  snprintf(out, n, "%.1fG", b/(1024.0*1024*1024));
+}
+
+// Re-read g_path into g_entries; resets selection to the top.
+static void files_reload() {
+  g_entry_count   = 0;
+  g_entries_trunc = false;
+  g_file_sel      = 0;
+  g_file_top      = 0;
+  if (g_sd_ok && g_entries) {
+    g_entry_count = sd_list(g_path, g_entries, SD_MAX_ENTRIES, &g_entries_trunc);
+  }
+}
 
 static void reset_screen() {
   g_kblen = 0;
@@ -266,6 +331,10 @@ static void act_usb_kb()  { g_xport = XPORT_USB; reset_screen(); g_view = VIEW_K
 static void act_usb_ms()  { g_xport = XPORT_USB; reset_screen(); g_view = VIEW_MOUSE; }
 static void act_usb_gp()  { g_xport = XPORT_USB; reset_screen(); g_view = VIEW_PAD; }
 
+static void duck_open(Xport xp);   // defined below (mount SD + start radio + list /duck)
+static void act_ble_duck() { duck_open(XPORT_BLE); }
+static void act_usb_duck() { duck_open(XPORT_USB); }
+
 static char g_info_buf[96];
 static void act_forget() {
   if (bhid_forget_bonds())
@@ -289,6 +358,32 @@ static void act_info() {
 }
 static void act_about()   { show_msg("ABOUT", "NEXUS\nBLE + USB HID\nCardputer ESP32-S3\nnexus // cyberdeck"); }
 
+// ---------- Storage actions ----------
+static void act_browse() {
+  if (!g_sd_ok || !g_entries) { show_msg("STORAGE", "No card.\nInsert microSD\nand pick Refresh."); return; }
+  strcpy(g_path, "/");
+  files_reload();
+  g_view = VIEW_FILES;
+}
+static void act_card_info() {
+  if (!g_sd_ok) { show_msg("CARD INFO", "No card mounted.\nPick Refresh after\ninserting a card."); return; }
+  char name[32] = {0}; uint64_t cardb = 0, totb = 0, freb = 0;
+  sd_info(name, sizeof(name), &cardb, &totb, &freb);
+  char cs[16], ts[16], fs[16];
+  fmt_size(cardb, cs, sizeof(cs));
+  fmt_size(totb,  ts, sizeof(ts));
+  fmt_size(freb,  fs, sizeof(fs));
+  snprintf(g_sd_info_buf, sizeof(g_sd_info_buf),
+           "card  %s\nsize  %s\nfs    FAT (%s)\nfree  %s", name, cs, ts, fs);
+  show_msg("CARD INFO", g_sd_info_buf);
+}
+static void act_refresh() {
+  sd_unmount();
+  g_sd_ok = sd_mount();
+  if (g_sd_ok && g_view == VIEW_FILES) files_reload();
+  show_msg("STORAGE", g_sd_ok ? "Card remounted." : "No card found.");
+}
+
 // ---------- Menu tree ----------
 static MenuItem control_items[] = {
   { "Keyboard", KIND_ACTION, 0, act_ble_kb, 0, 0 },
@@ -299,10 +394,11 @@ static Menu control_menu = { "CONTROL", control_items, 3, 0, 0 };
 
 static MenuItem ble_items[] = {
   { "Control",      KIND_SUBMENU, &control_menu, 0, 0, 0 },
+  { "Duck",         KIND_ACTION,  0, act_ble_duck, 0, 0 },
   { "Forget Bonds", KIND_ACTION,  0, act_forget, 0, 0 },
   { "Info",         KIND_ACTION,  0, act_info,   0, 0 },
 };
-static Menu ble_menu = { "BLE", ble_items, 3, 0, 0 };
+static Menu ble_menu = { "BLE", ble_items, 4, 0, 0 };
 
 static MenuItem set_items[] = {
   { "Logging",   KIND_TOGGLE, 0, 0, &g_log_on,  on_log_toggle },
@@ -321,15 +417,25 @@ static Menu usb_control_menu = { "USB CONTROL", usb_control_items, 3, 0, 0 };
 
 static MenuItem usb_items[] = {
   { "Control", KIND_SUBMENU, &usb_control_menu, 0, 0, 0 },
+  { "Duck",    KIND_ACTION,  0, act_usb_duck, 0, 0 },
 };
-static Menu usb_menu = { "USB", usb_items, 1, 0, 0 };
+static Menu usb_menu = { "USB", usb_items, 2, 0, 0 };
+
+// Storage: microSD browser (lazy-mount on entry, auto-unmount on leaving).
+static MenuItem storage_items[] = {
+  { "Browse",    KIND_ACTION, 0, act_browse,    0, 0 },
+  { "Card Info", KIND_ACTION, 0, act_card_info, 0, 0 },
+  { "Refresh",   KIND_ACTION, 0, act_refresh,   0, 0 },
+};
+static Menu storage_menu = { "STORAGE", storage_items, 3, 0, 0 };
 
 static MenuItem root_items[] = {
-  { "BLE",      KIND_SUBMENU, &ble_menu, 0, 0, 0 },
-  { "USB",      KIND_SUBMENU, &usb_menu, 0, 0, 0 },
-  { "Settings", KIND_SUBMENU, &set_menu, 0, 0, 0 },
+  { "BLE",      KIND_SUBMENU, &ble_menu,     0, 0, 0 },
+  { "USB",      KIND_SUBMENU, &usb_menu,     0, 0, 0 },
+  { "Storage",  KIND_SUBMENU, &storage_menu, 0, 0, 0 },
+  { "Settings", KIND_SUBMENU, &set_menu,     0, 0, 0 },
 };
-static Menu root_menu = { "NEXUS", root_items, 3, 0, 0 };
+static Menu root_menu = { "NEXUS", root_items, 4, 0, 0 };
 
 // ---------- Layout ----------
 static const int W = 240, H = 135;
@@ -677,6 +783,26 @@ static void sync_radios() {
   was_usb = nu;
 }
 
+// Storage mirrors the radios: mount the SD (and grab the entry buffer) when the
+// Storage subtree is on the stack, release both when it leaves.
+static void sync_storage() {
+  static bool was = false;
+  bool now = stack_has(&storage_menu);
+  if (now && !was) {
+    g_sd_ok = sd_mount();
+    if (g_sd_ok && !g_entries) {
+      g_entries = (sd_entry_t*)malloc(sizeof(sd_entry_t) * SD_MAX_ENTRIES);
+      if (!g_entries) g_sd_ok = false;
+    }
+  }
+  if (!now && was) {
+    if (g_entries) { free(g_entries); g_entries = 0; }
+    sd_unmount();
+    g_sd_ok = false;
+  }
+  was = now;
+}
+
 static void enter_item(Menu* m) {
   MenuItem* it = &m->items[m->sel];
   switch (it->kind) {
@@ -840,6 +966,571 @@ static void tick_pad() {
   }
 }
 
+// ---------- Storage (microSD) browse screen ----------
+static void draw_files() {
+  canvas.fillSprite(C_BG);
+  // Title = current path, trimmed from the left if too long for the bar.
+  const char* title = g_path;
+  if (strlen(title) > 22) title = title + strlen(title) - 22;
+  draw_statusbar(title);
+
+  canvas.setFont(&fonts::Font2);
+  if (g_entry_count == 0) {
+    canvas.setTextColor(C_DIM, C_BG);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.drawString("(empty)", 12, LIST_Y + 4);
+  }
+
+  char sz[16];
+  for (int i = 0; i < VIS; i++) {
+    int idx = g_file_top + i;
+    if (idx >= g_entry_count) break;
+    sd_entry_t* e = &g_entries[idx];
+    int y = LIST_Y + i * ROW_H;
+    bool sel = (idx == g_file_sel);
+    if (sel) canvas.fillRoundRect(4, y, W - 8, ROW_H - 2, 3, C_SELBG);
+
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.setTextColor(e->is_dir ? C_ACCENT : C_TEXT, sel ? C_SELBG : C_BG);
+    char nm[SD_NAME_MAX + 2];
+    snprintf(nm, sizeof(nm), "%s%s", e->is_dir ? "/" : " ", e->name);
+    canvas.drawString(nm, 12, y + 3);
+
+    canvas.setTextDatum(textdatum_t::top_right);
+    canvas.setTextColor(C_DIM, sel ? C_SELBG : C_BG);
+    if (e->is_dir) canvas.drawString("dir", W - 12, y + 3);
+    else { fmt_size(e->size, sz, sizeof(sz)); canvas.drawString(sz, W - 12, y + 3); }
+  }
+
+  // Footer: entry count (+ truncation flag) and hints.
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  char ft[40];
+  snprintf(ft, sizeof(ft), "%d%s  tab act  , up",
+           g_entry_count, g_entries_trunc ? "+" : "");
+  canvas.drawString(ft, 8, H - 2);
+  canvas.pushSprite(0, 0);
+}
+
+// Append `name` to g_path (descend into a folder).
+static void path_push(const char* name) {
+  size_t n = strlen(g_path);
+  if (n == 0 || g_path[n - 1] != '/') { strncat(g_path, "/", sizeof(g_path) - n - 1); n++; }
+  strncat(g_path, name, sizeof(g_path) - n - 1);
+}
+// Drop the last path component (go up). Returns false if already at root.
+static bool path_pop() {
+  if (strcmp(g_path, "/") == 0) return false;
+  size_t n = strlen(g_path);
+  if (n && g_path[n - 1] == '/') g_path[--n] = 0;     // drop trailing slash
+  while (n && g_path[n - 1] != '/') g_path[--n] = 0;  // drop component
+  if (n == 0) strcpy(g_path, "/");
+  else if (n > 1 && g_path[n - 1] == '/') g_path[n - 1] = 0;
+  return true;
+}
+
+static void tick_files() {
+  char k = kb_poll();
+  if (!k) return;
+  switch (k) {
+    case ';':
+      if (g_file_sel > 0) g_file_sel--;
+      if (g_file_sel < g_file_top) g_file_top = g_file_sel;
+      break;
+    case '.':
+      if (g_file_sel < g_entry_count - 1) g_file_sel++;
+      if (g_file_sel >= g_file_top + VIS) g_file_top = g_file_sel - VIS + 1;
+      break;
+    case '\t':
+      open_actions();
+      break;
+    case '/':
+    case '\n':
+    case '\r': {
+      if (g_entry_count == 0) { open_actions(); break; }
+      sd_entry_t* e = &g_entries[g_file_sel];
+      if (e->is_dir) { path_push(e->name); files_reload(); }
+      else open_actions();
+      break;
+    }
+    case ',':
+      if (path_pop()) files_reload();      // up one level
+      else leave_screen();                 // at root -> back to Storage menu
+      break;
+    case '`':
+      leave_screen();
+      break;
+    default: break;
+  }
+}
+
+// ---------- Storage write ops: action sheet / text input / delete confirm ----------
+static void open_actions() {
+  g_act_n = 0; g_act_sel = 0;
+  if (g_entry_count > 0) {
+    g_act_labels[g_act_n] = "Open";   g_act_codes[g_act_n++] = A_OPEN;
+    g_act_labels[g_act_n] = "Rename"; g_act_codes[g_act_n++] = A_RENAME;
+    g_act_labels[g_act_n] = "Delete"; g_act_codes[g_act_n++] = A_DELETE;
+  }
+  g_act_labels[g_act_n] = "New File";   g_act_codes[g_act_n++] = A_NEWFILE;
+  g_act_labels[g_act_n] = "New Folder"; g_act_codes[g_act_n++] = A_NEWDIR;
+  g_view = VIEW_FILEACT;
+}
+
+static void begin_text(int mode, const char* preset) {
+  g_tin_mode = mode;
+  g_tin_len = 0; g_tin[0] = 0;
+  if (preset) {
+    strncpy(g_tin, preset, SD_NAME_MAX - 1);
+    g_tin[SD_NAME_MAX - 1] = 0;
+    g_tin_len = strlen(g_tin);
+  }
+  // Absorb keys still held from the action-sheet selection (e.g. the Enter
+  // that chose this item) so tick_textin does not see them as fresh presses.
+  char hld[8];
+  g_prev_n = kb_scan_full(hld, 8, NULL);
+  memcpy(g_prev_held, hld, g_prev_n);
+  g_view = VIEW_TEXTIN;
+}
+
+static void do_action(int code) {
+  sd_entry_t* e = (g_entry_count > 0) ? &g_entries[g_file_sel] : 0;
+  switch (code) {
+    case A_OPEN:
+      if (!e) break;
+      if (e->is_dir) { path_push(e->name); files_reload(); g_view = VIEW_FILES; }
+      else {
+        char sz[16]; fmt_size(e->size, sz, sizeof(sz));
+        snprintf(g_sd_info_buf, sizeof(g_sd_info_buf), "%s\nsize  %s", e->name, sz);
+        show_msg("FILE", g_sd_info_buf);
+      }
+      break;
+    case A_RENAME:
+      if (!e) break;
+      strncpy(g_rename_old, e->name, SD_NAME_MAX - 1); g_rename_old[SD_NAME_MAX - 1] = 0;
+      begin_text(TIN_RENAME, e->name);
+      break;
+    case A_DELETE:
+      if (!e) break;
+      strncpy(g_del_name, e->name, SD_NAME_MAX - 1); g_del_name[SD_NAME_MAX - 1] = 0;
+      g_del_isdir = e->is_dir;
+      g_view = VIEW_CONFIRM;
+      break;
+    case A_NEWFILE: begin_text(TIN_NEWFILE, 0); break;
+    case A_NEWDIR:  begin_text(TIN_NEWDIR, 0);  break;
+    default: break;
+  }
+}
+
+static bool name_valid(const char* sname) {
+  if (!sname[0]) return false;
+  for (const char* q = sname; *q; q++)
+    if (*q == '/' || *q == '\\' || (unsigned char)*q < 0x20) return false;
+  return true;
+}
+
+static void commit_text() {
+  if (!name_valid(g_tin)) { show_msg("NAME", "Invalid name.\nNo / or backslash,\nnot empty."); return; }
+  char rel[400];
+  bool ok = false;
+  if (g_tin_mode == TIN_RENAME) {
+    char oldrel[400];
+    entry_rel(g_rename_old, oldrel, sizeof(oldrel));
+    entry_rel(g_tin, rel, sizeof(rel));
+    ok = sd_rename(oldrel, rel);
+  } else if (g_tin_mode == TIN_NEWFILE) {
+    entry_rel(g_tin, rel, sizeof(rel));
+    ok = sd_make_file(rel);
+  } else if (g_tin_mode == TIN_NEWDIR) {
+    entry_rel(g_tin, rel, sizeof(rel));
+    ok = sd_make_dir(rel);
+  }
+  if (!ok) { show_msg("STORAGE", "Operation failed.\nName may exist\nor card is full."); return; }
+  files_reload();
+  g_view = VIEW_FILES;
+}
+
+static void draw_fileact() {
+  canvas.fillSprite(C_BG);
+  const char* t = (g_entry_count > 0) ? g_entries[g_file_sel].name : "ACTIONS";
+  draw_statusbar(t);
+  canvas.setFont(&fonts::Font2);
+  for (int i = 0; i < g_act_n; i++) {
+    int y = LIST_Y + i * ROW_H;
+    bool sel = (i == g_act_sel);
+    if (sel) canvas.fillRoundRect(4, y, W - 8, ROW_H - 2, 3, C_SELBG);
+    bool danger = (g_act_codes[i] == A_DELETE);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.setTextColor(danger ? C_RED : C_TEXT, sel ? C_SELBG : C_BG);
+    canvas.drawString(g_act_labels[i], 14, y + 3);
+  }
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("ret ok   , back", 8, H - 2);
+  canvas.pushSprite(0, 0);
+}
+
+static void tick_fileact() {
+  char k = kb_poll();
+  if (!k) return;
+  switch (k) {
+    case ';': if (g_act_sel > 0) g_act_sel--; break;
+    case '.': if (g_act_sel < g_act_n - 1) g_act_sel++; break;
+    case '/':
+    case '\n':
+    case '\r': do_action(g_act_codes[g_act_sel]); break;
+    case ',':
+    case '`': g_view = VIEW_FILES; break;
+    default: break;
+  }
+}
+
+static void draw_textin() {
+  canvas.fillSprite(C_BG);
+  const char* ttl = (g_tin_mode == TIN_RENAME)  ? "Rename"
+                  : (g_tin_mode == TIN_NEWFILE) ? "New File" : "New Folder";
+  draw_statusbar(ttl);
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("name:", 10, LIST_Y + 2);
+  int by = LIST_Y + 24;
+  canvas.drawRoundRect(8, by, W - 16, 26, 3, C_DIM);
+  canvas.setTextColor(C_ACCENT, C_BG);
+  char shown[SD_NAME_MAX + 2];
+  snprintf(shown, sizeof(shown), "%s_", g_tin);
+  canvas.drawString(shown, 14, by + 5);
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("ret save   ` cancel", 8, H - 2);
+  canvas.pushSprite(0, 0);
+}
+
+static void tick_textin() {
+  char h[8];
+  bool shift = false;
+  int n = kb_scan_full(h, 8, &shift);
+  for (int i = 0; i < n; i++) {
+    char c = h[i];
+    bool was = false;
+    for (int j = 0; j < g_prev_n; j++) if (g_prev_held[j] == c) { was = true; break; }
+    if (was) continue;
+    if (c == '`') { g_prev_n = 0; g_prev_held[0] = 0; g_view = VIEW_FILEACT; return; }
+    if (c == '\n' || c == '\r') { memcpy(g_prev_held, h, n); g_prev_n = n; commit_text(); return; }
+    if (c == 0x08) { if (g_tin_len > 0) g_tin[--g_tin_len] = 0; continue; }
+    if (c == '\t') continue;
+    if ((unsigned char)c < 0x20) continue;
+    if (c == '/' || c == '\\') continue;
+    char e = c;
+    if (shift && e >= 'a' && e <= 'z') e = e - 'a' + 'A';
+    if (g_tin_len < SD_NAME_MAX - 1) { g_tin[g_tin_len++] = e; g_tin[g_tin_len] = 0; }
+  }
+  memcpy(g_prev_held, h, n);
+  g_prev_n = n;
+}
+
+static void draw_confirm() {
+  canvas.fillSprite(C_BG);
+  draw_statusbar("Delete?");
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  canvas.setTextColor(C_TEXT, C_BG);
+  canvas.drawString(g_del_isdir ? "Delete folder:" : "Delete file:", 10, LIST_Y + 2);
+  canvas.setTextColor(C_RED, C_BG);
+  char nm[SD_NAME_MAX + 2];
+  snprintf(nm, sizeof(nm), "%s", g_del_name);
+  canvas.drawString(nm, 10, LIST_Y + 26);
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("ret delete   , cancel", 8, H - 2);
+  canvas.pushSprite(0, 0);
+}
+
+static void tick_confirm() {
+  char k = kb_poll();
+  if (!k) return;
+  if (k == '/' || k == '\n' || k == '\r') {
+    char rel[400];
+    entry_rel(g_del_name, rel, sizeof(rel));
+    bool ok = sd_delete(rel, g_del_isdir);
+    if (!ok) { show_msg("STORAGE", g_del_isdir ? "Folder not empty\nor delete failed." : "Delete failed."); return; }
+    files_reload();
+    g_view = VIEW_FILES;
+  } else if (k == ',' || k == '`') {
+    g_view = VIEW_FILES;
+  }
+}
+
+// ======================= DUCK (BadUSB) =======================
+#define DUCK_MAX         64
+#define DUCK_SCRIPT_MAX  8192
+static sd_entry_t* g_duck = 0;
+static int  g_duck_count = 0, g_duck_sel = 0, g_duck_top = 0;
+static bool g_duck_ok = false;
+static int  g_duckrun_idx = 0;
+static int  g_duckrun_state = 0;   // 0 idle, 1 running, 2 done
+static int  g_duck_chardelay = 5;  // ms between characters
+static int  g_duck_defdelay  = 0;  // ms after each command
+
+// ASCII -> HID usage (US layout) + whether Shift is needed.
+static bool char_to_hid(char c, uint8_t* u, bool* sh) {
+  *sh = false;
+  if (c >= 'a' && c <= 'z') { *u = 4 + (c - 'a'); return true; }
+  if (c >= 'A' && c <= 'Z') { *u = 4 + (c - 'A'); *sh = true; return true; }
+  if (c >= '1' && c <= '9') { *u = 0x1E + (c - '1'); return true; }
+  switch (c) {
+    case '0': *u = 0x27; return true;
+    case '!': *u = 0x1E; *sh = true; return true;
+    case '@': *u = 0x1F; *sh = true; return true;
+    case '#': *u = 0x20; *sh = true; return true;
+    case '$': *u = 0x21; *sh = true; return true;
+    case '%': *u = 0x22; *sh = true; return true;
+    case '^': *u = 0x23; *sh = true; return true;
+    case '&': *u = 0x24; *sh = true; return true;
+    case '*': *u = 0x25; *sh = true; return true;
+    case '(': *u = 0x26; *sh = true; return true;
+    case ')': *u = 0x27; *sh = true; return true;
+    case ' ': *u = 0x2C; return true;
+    case '-': *u = 0x2D; return true;
+    case '_': *u = 0x2D; *sh = true; return true;
+    case '=': *u = 0x2E; return true;
+    case '+': *u = 0x2E; *sh = true; return true;
+    case '[': *u = 0x2F; return true;
+    case '{': *u = 0x2F; *sh = true; return true;
+    case ']': *u = 0x30; return true;
+    case '}': *u = 0x30; *sh = true; return true;
+    case '\\': *u = 0x31; return true;
+    case '|': *u = 0x31; *sh = true; return true;
+    case ';': *u = 0x33; return true;
+    case ':': *u = 0x33; *sh = true; return true;
+    case '\'': *u = 0x34; return true;
+    case '"': *u = 0x34; *sh = true; return true;
+    case '`': *u = 0x35; return true;
+    case '~': *u = 0x35; *sh = true; return true;
+    case ',': *u = 0x36; return true;
+    case '<': *u = 0x36; *sh = true; return true;
+    case '.': *u = 0x37; return true;
+    case '>': *u = 0x37; *sh = true; return true;
+    case '/': *u = 0x38; return true;
+    case '?': *u = 0x38; *sh = true; return true;
+    case '\t': *u = 0x2B; return true;
+    case '\n': case '\r': *u = 0x28; return true;
+    default: return false;
+  }
+}
+
+static void duck_press(uint8_t mod, uint8_t usage) {
+  uint8_t keys[6] = { usage, 0, 0, 0, 0, 0 };
+  hid_key(mod, keys);
+  vTaskDelay(pdMS_TO_TICKS(2));
+  uint8_t empty[6] = {0};
+  hid_key(0, empty);
+}
+static void duck_type_char(char c) {
+  uint8_t u; bool sh;
+  if (!char_to_hid(c, &u, &sh)) return;
+  duck_press(sh ? 0x02 : 0, u);
+  vTaskDelay(pdMS_TO_TICKS(g_duck_chardelay));
+}
+static void duck_type_string(const char* str) { for (; *str; str++) duck_type_char(*str); }
+
+static bool is_mod_token(const char* t, uint8_t* mbit) {
+  if (!strcasecmp(t,"GUI") || !strcasecmp(t,"WINDOWS") || !strcasecmp(t,"COMMAND") || !strcasecmp(t,"META")) { *mbit = 0x08; return true; }
+  if (!strcasecmp(t,"CTRL") || !strcasecmp(t,"CONTROL")) { *mbit = 0x01; return true; }
+  if (!strcasecmp(t,"ALT")  || !strcasecmp(t,"OPTION"))  { *mbit = 0x04; return true; }
+  if (!strcasecmp(t,"SHIFT")) { *mbit = 0x02; return true; }
+  return false;
+}
+static bool key_token_usage(const char* t, uint8_t* u, bool* sh) {
+  *sh = false;
+  if (strlen(t) == 1) return char_to_hid(t[0], u, sh);
+  if ((t[0]=='F'||t[0]=='f') && isdigit((unsigned char)t[1])) {
+    int n = atoi(t + 1); if (n >= 1 && n <= 12) { *u = 0x3A + (n - 1); return true; }
+  }
+  if (!strcasecmp(t,"ENTER")||!strcasecmp(t,"RETURN")) { *u=0x28; return true; }
+  if (!strcasecmp(t,"ESC")||!strcasecmp(t,"ESCAPE"))   { *u=0x29; return true; }
+  if (!strcasecmp(t,"BACKSPACE"))  { *u=0x2A; return true; }
+  if (!strcasecmp(t,"TAB"))        { *u=0x2B; return true; }
+  if (!strcasecmp(t,"SPACE"))      { *u=0x2C; return true; }
+  if (!strcasecmp(t,"CAPSLOCK"))   { *u=0x39; return true; }
+  if (!strcasecmp(t,"DELETE")||!strcasecmp(t,"DEL")) { *u=0x4C; return true; }
+  if (!strcasecmp(t,"INSERT"))     { *u=0x49; return true; }
+  if (!strcasecmp(t,"HOME"))       { *u=0x4A; return true; }
+  if (!strcasecmp(t,"END"))        { *u=0x4D; return true; }
+  if (!strcasecmp(t,"PAGEUP"))     { *u=0x4B; return true; }
+  if (!strcasecmp(t,"PAGEDOWN"))   { *u=0x4E; return true; }
+  if (!strcasecmp(t,"UP")||!strcasecmp(t,"UPARROW"))       { *u=0x52; return true; }
+  if (!strcasecmp(t,"DOWN")||!strcasecmp(t,"DOWNARROW"))   { *u=0x51; return true; }
+  if (!strcasecmp(t,"LEFT")||!strcasecmp(t,"LEFTARROW"))   { *u=0x50; return true; }
+  if (!strcasecmp(t,"RIGHT")||!strcasecmp(t,"RIGHTARROW")) { *u=0x4F; return true; }
+  if (!strcasecmp(t,"PRINTSCREEN")) { *u=0x46; return true; }
+  if (!strcasecmp(t,"MENU")||!strcasecmp(t,"APP")) { *u=0x65; return true; }
+  return false;
+}
+
+static bool duck_check_abort() {
+  char h[8]; int n = kb_scan_full(h, 8, NULL);
+  for (int i = 0; i < n; i++) if (h[i] == '`') return true;
+  return false;
+}
+
+// Execute one script line (mutates `line`).
+static void duck_exec_line(char* line) {
+  char* p = line;
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p == 0) return;
+  char cmd[16]; int ci = 0; char* q = p;
+  while (*q && *q != ' ' && *q != '\t' && ci < 15) cmd[ci++] = *q++;
+  cmd[ci] = 0;
+  char* arg = q; while (*arg == ' ' || *arg == '\t') arg++;
+
+  if (!strcasecmp(cmd, "REM")) return;
+  if (!strcasecmp(cmd, "STRING"))   { duck_type_string(arg); return; }
+  if (!strcasecmp(cmd, "STRINGLN")) { duck_type_string(arg); duck_press(0, 0x28); return; }
+  if (!strcasecmp(cmd, "DELAY"))    { int ms = atoi(arg); if (ms > 0) vTaskDelay(pdMS_TO_TICKS(ms)); return; }
+  if (!strcasecmp(cmd, "DEFAULT_DELAY") || !strcasecmp(cmd, "DEFAULTDELAY")) { g_duck_defdelay = atoi(arg); return; }
+
+  // Otherwise a key / modifier combo: tokenize the whole line.
+  uint8_t mod = 0, usage = 0; bool anyKey = false, shift = false;
+  char* tk = strtok(line, " \t");
+  while (tk) {
+    uint8_t mbit;
+    if (is_mod_token(tk, &mbit)) mod |= mbit;
+    else { uint8_t u; bool s2; if (key_token_usage(tk, &u, &s2)) { usage = u; if (s2) shift = true; anyKey = true; } }
+    tk = strtok(NULL, " \t");
+  }
+  if (shift) mod |= 0x02;
+  if (mod || anyKey) duck_press(mod, usage);
+}
+
+static void duck_run(const char* name) {
+  char path[SD_NAME_MAX + 8];
+  snprintf(path, sizeof(path), "/duck/%s", name);
+  char* buf = (char*)malloc(DUCK_SCRIPT_MAX);
+  if (!buf) { show_msg("DUCK", "Out of memory."); return; }
+  int n = sd_read_file(path, buf, DUCK_SCRIPT_MAX);
+  if (n < 0) { free(buf); show_msg("DUCK", "Read failed."); return; }
+  g_duck_defdelay = 0;
+  char* line = buf;
+  while (line && *line) {
+    char* nl = strchr(line, '\n');
+    if (nl) *nl = 0;
+    size_t ll = strlen(line);
+    if (ll && line[ll - 1] == '\r') line[ll - 1] = 0;
+    duck_exec_line(line);
+    if (g_duck_defdelay > 0) vTaskDelay(pdMS_TO_TICKS(g_duck_defdelay));
+    if (duck_check_abort()) break;
+    line = nl ? nl + 1 : 0;
+  }
+  free(buf);
+}
+
+static bool ends_txt(const char* n) {
+  size_t l = strlen(n);
+  return l > 4 && !strcasecmp(n + l - 4, ".txt");
+}
+static void duck_reload() {
+  g_duck_count = 0; g_duck_sel = 0; g_duck_top = 0;
+  if (!g_duck_ok || !g_duck) return;
+  bool t; int n = sd_list("/duck", g_duck, DUCK_MAX, &t);
+  int w = 0;
+  for (int i = 0; i < n; i++)
+    if (!g_duck[i].is_dir && ends_txt(g_duck[i].name)) { if (w != i) g_duck[w] = g_duck[i]; w++; }
+  g_duck_count = w;
+}
+
+static void duck_open(Xport xp) {
+  g_xport = xp;
+  if (xp == XPORT_USB) uhid_start("Nexus"); else bhid_start("Nexus");
+  g_duck_ok = sd_mount();
+  if (g_duck_ok) {
+    sd_make_dir("/duck");    // harmless if it exists
+    if (!g_duck) { g_duck = (sd_entry_t*)malloc(sizeof(sd_entry_t) * DUCK_MAX); if (!g_duck) g_duck_ok = false; }
+  }
+  duck_reload();
+  g_view = VIEW_DUCK;
+}
+static void duck_close() {
+  if (g_xport == XPORT_USB) uhid_stop(); else bhid_stop();
+  if (g_duck) { free(g_duck); g_duck = 0; }
+  sd_unmount();
+  g_duck_ok = false; g_duck_count = 0;
+  leave_screen();
+}
+
+static void draw_duck() {
+  canvas.fillSprite(C_BG);
+  char ttl[16]; snprintf(ttl, sizeof(ttl), "DUCK %s", xport_name());
+  draw_statusbar(ttl);
+  canvas.setFont(&fonts::Font2);
+  if (g_duck_count == 0) {
+    canvas.setTextColor(C_DIM, C_BG);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.drawString("no scripts in /duck", 12, LIST_Y + 4);
+    canvas.drawString("add .txt payloads", 12, LIST_Y + 26);
+  }
+  for (int i = 0; i < VIS; i++) {
+    int idx = g_duck_top + i;
+    if (idx >= g_duck_count) break;
+    int y = LIST_Y + i * ROW_H;
+    bool sel = (idx == g_duck_sel);
+    if (sel) canvas.fillRoundRect(4, y, W - 8, ROW_H - 2, 3, C_SELBG);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.setTextColor(C_TEXT, sel ? C_SELBG : C_BG);
+    canvas.drawString(g_duck[idx].name, 12, y + 3);
+  }
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString(", back", 8, H - 2);
+  canvas.pushSprite(0, 0);
+}
+static void tick_duck() {
+  char k = kb_poll();
+  if (!k) return;
+  switch (k) {
+    case ';': if (g_duck_sel > 0) g_duck_sel--; if (g_duck_sel < g_duck_top) g_duck_top = g_duck_sel; break;
+    case '.': if (g_duck_sel < g_duck_count - 1) g_duck_sel++; if (g_duck_sel >= g_duck_top + VIS) g_duck_top = g_duck_sel - VIS + 1; break;
+    case '/': case '\n': case '\r':
+      if (g_duck_count > 0) { g_duckrun_idx = g_duck_sel; g_duckrun_state = 0; g_view = VIEW_DUCKRUN; }
+      break;
+    case ',': case '`': duck_close(); break;
+    default: break;
+  }
+}
+
+static void draw_duckrun() {
+  canvas.fillSprite(C_BG);
+  draw_statusbar(g_duck[g_duckrun_idx].name);
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  bool conn = hid_connected();
+  if (g_duckrun_state == 1)      { canvas.setTextColor(C_AMBER, C_BG);  canvas.drawString("RUNNING...", 12, LIST_Y + 4); }
+  else if (g_duckrun_state == 2) { canvas.setTextColor(C_ACCENT, C_BG); canvas.drawString("done", 12, LIST_Y + 4); }
+  else if (conn)                 { canvas.setTextColor(C_ACCENT, C_BG); canvas.drawString("host connected", 12, LIST_Y + 4); }
+  else if (g_xport == XPORT_USB) { canvas.setTextColor(C_AMBER, C_BG);  canvas.drawString("waiting for USB host", 12, LIST_Y + 4); }
+  else                           { canvas.setTextColor(C_AMBER, C_BG);  canvas.drawString("advertising  PIN " NEXUS_PIN, 12, LIST_Y + 4); }
+  canvas.setTextColor(C_TEXT, C_BG);
+  canvas.drawString(conn ? "Enter: run payload" : "connect host first", 12, LIST_Y + 28);
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("` abort during run   , back", 8, H - 2);
+  canvas.pushSprite(0, 0);
+}
+static void tick_duckrun() {
+  char k = kb_poll();
+  if (!k) return;
+  if (k == '/' || k == '\n' || k == '\r') {
+    if (!hid_connected()) return;
+    g_duckrun_state = 1;
+    draw_duckrun();                 // show RUNNING before the blocking run
+    duck_run(g_duck[g_duckrun_idx].name);
+    g_duckrun_state = 2;
+  } else if (k == ',' || k == '`') {
+    g_view = VIEW_DUCK;
+  }
+}
+
 // ---------- Main ----------
 extern "C" void app_main(void) {
   esp_err_t e = nvs_flash_init();
@@ -903,6 +1594,7 @@ extern "C" void app_main(void) {
             default: break;
           }
           sync_radios();
+          sync_storage();
         }
         if (dirty && g_view == VIEW_MENU) draw_menu(cur(), (float)cur()->sel);
         break;
@@ -916,6 +1608,12 @@ extern "C" void app_main(void) {
       case VIEW_KB:    tick_kb();    if (g_view == VIEW_KB)    draw_kb_screen();    break;
       case VIEW_MOUSE: tick_mouse(); if (g_view == VIEW_MOUSE) draw_mouse_screen(); break;
       case VIEW_PAD:   tick_pad();   if (g_view == VIEW_PAD)   draw_pad_screen();   break;
+      case VIEW_FILES:   tick_files();   if (g_view == VIEW_FILES)   draw_files();   break;
+      case VIEW_FILEACT: tick_fileact(); if (g_view == VIEW_FILEACT) draw_fileact(); break;
+      case VIEW_TEXTIN:  tick_textin();  if (g_view == VIEW_TEXTIN)  draw_textin();  break;
+      case VIEW_CONFIRM: tick_confirm(); if (g_view == VIEW_CONFIRM) draw_confirm(); break;
+      case VIEW_DUCK:    tick_duck();    if (g_view == VIEW_DUCK)    draw_duck();    break;
+      case VIEW_DUCKRUN: tick_duckrun(); if (g_view == VIEW_DUCKRUN) draw_duckrun(); break;
     }
     vTaskDelay(pdMS_TO_TICKS(16));
   }
