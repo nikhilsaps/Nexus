@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdio.h>
 #include "ble_hid.h"
+#include "usb_hid.h"
 
 // ---------- Palette (cyberdeck terminal) ----------
 static M5GFX display;
@@ -146,6 +147,7 @@ static void batt_sample() {
 // ---------- Radio status model (drives top-bar icons) ----------
 // BLE: 0 off, 1 advertising, 2 connected.  WiFi: 0 off, else signal 1..100.
 static int g_ble_state = 0;
+static int g_usb_state = 0;   // 0 off, 1 waiting for host, 2 mounted
 static int g_wifi_pct  = 0;   // 0 = not in use (icon hidden) until WiFi lands
 #define NEXUS_PIN "123456"   // fixed pairing passkey (mirrors esp_hid_gap.c)
 
@@ -171,6 +173,22 @@ struct Menu {
 // ---------- App views ----------
 enum AppView { VIEW_MENU, VIEW_MSG, VIEW_KB, VIEW_MOUSE, VIEW_PAD };
 static AppView g_view = VIEW_MENU;
+
+// ---------- Transport (BLE vs USB) ----------
+// HID screens are shared; g_xport decides which stack a report goes to.
+enum Xport { XPORT_BLE, XPORT_USB };
+static Xport g_xport = XPORT_BLE;
+static const char* xport_name() { return g_xport == XPORT_USB ? "USB" : "BLE"; }
+static bool hid_connected() { return g_xport == XPORT_USB ? uhid_connected() : bhid_connected(); }
+static void hid_key(uint8_t mod, const uint8_t keys6[6]) {
+  if (g_xport == XPORT_USB) uhid_key_report(mod, keys6); else bhid_key_report(mod, keys6);
+}
+static void hid_mouse(uint8_t b, int8_t dx, int8_t dy, int8_t w) {
+  if (g_xport == XPORT_USB) uhid_send_mouse(b, dx, dy, w); else bhid_send_mouse(b, dx, dy, w);
+}
+static void hid_pad(uint16_t b, int8_t x, int8_t y) {
+  if (g_xport == XPORT_USB) uhid_send_gamepad(b, x, y); else bhid_send_gamepad(b, x, y);
+}
 
 static bool g_log_on  = false;
 static bool g_anim_on = true;
@@ -241,9 +259,12 @@ static void on_anim_toggle(bool v) { nvs_save(); }
 
 // ---------- Actions ----------
 static void show_msg(const char* t, const char* b) { g_msg_title = t; g_msg_body = b; g_view = VIEW_MSG; }
-static void act_ble_kb()  { reset_screen(); g_view = VIEW_KB; }
-static void act_ble_ms()  { reset_screen(); g_view = VIEW_MOUSE; }
-static void act_ble_gp()  { reset_screen(); g_view = VIEW_PAD; }
+static void act_ble_kb()  { g_xport = XPORT_BLE; reset_screen(); g_view = VIEW_KB; }
+static void act_ble_ms()  { g_xport = XPORT_BLE; reset_screen(); g_view = VIEW_MOUSE; }
+static void act_ble_gp()  { g_xport = XPORT_BLE; reset_screen(); g_view = VIEW_PAD; }
+static void act_usb_kb()  { g_xport = XPORT_USB; reset_screen(); g_view = VIEW_KB; }
+static void act_usb_ms()  { g_xport = XPORT_USB; reset_screen(); g_view = VIEW_MOUSE; }
+static void act_usb_gp()  { g_xport = XPORT_USB; reset_screen(); g_view = VIEW_PAD; }
 
 static char g_info_buf[96];
 static void act_forget() {
@@ -266,7 +287,7 @@ static void act_info() {
   g_msg_body  = g_info_buf;
   g_view      = VIEW_MSG;
 }
-static void act_about()   { show_msg("ABOUT", "NEXUS\nStage 2  BLE HID\nCardputer ESP32-S3\nnexus // cyberdeck"); }
+static void act_about()   { show_msg("ABOUT", "NEXUS\nBLE + USB HID\nCardputer ESP32-S3\nnexus // cyberdeck"); }
 
 // ---------- Menu tree ----------
 static MenuItem control_items[] = {
@@ -290,11 +311,25 @@ static MenuItem set_items[] = {
 };
 static Menu set_menu = { "SETTINGS", set_items, 3, 0, 0 };
 
+// USB mirrors BLE: USB > Control > Keyboard / Mouse / Gamepad (native USB HID).
+static MenuItem usb_control_items[] = {
+  { "Keyboard", KIND_ACTION, 0, act_usb_kb, 0, 0 },
+  { "Mouse",    KIND_ACTION, 0, act_usb_ms, 0, 0 },
+  { "Gamepad",  KIND_ACTION, 0, act_usb_gp, 0, 0 },
+};
+static Menu usb_control_menu = { "USB CONTROL", usb_control_items, 3, 0, 0 };
+
+static MenuItem usb_items[] = {
+  { "Control", KIND_SUBMENU, &usb_control_menu, 0, 0, 0 },
+};
+static Menu usb_menu = { "USB", usb_items, 1, 0, 0 };
+
 static MenuItem root_items[] = {
   { "BLE",      KIND_SUBMENU, &ble_menu, 0, 0, 0 },
+  { "USB",      KIND_SUBMENU, &usb_menu, 0, 0, 0 },
   { "Settings", KIND_SUBMENU, &set_menu, 0, 0, 0 },
 };
-static Menu root_menu = { "NEXUS", root_items, 2, 0, 0 };
+static Menu root_menu = { "NEXUS", root_items, 3, 0, 0 };
 
 // ---------- Layout ----------
 static const int W = 240, H = 135;
@@ -363,6 +398,14 @@ static void draw_statusbar(const char* title) {
   if (g_wifi_pct > 0) {
     icon_wifi(rx, 13, g_wifi_pct);
     rx -= 12;
+  }
+  // USB HID state (dim = waiting for host, accent = mounted)
+  if (g_usb_state > 0) {
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextColor(g_usb_state == 2 ? C_ACCENT : C_DIM, C_BG);
+    canvas.setTextDatum(textdatum_t::top_right);
+    canvas.drawString("USB", rx, 1);
+    rx -= canvas.textWidth("USB") + 6;
   }
   canvas.drawFastHLine(0, BAR_H, W, C_SELBG);
 }
@@ -453,12 +496,17 @@ static void draw_msg() {
 
 // connection status chip (shared by HID screens)
 static void draw_conn_chip() {
-  bool c = bhid_connected();
+  bool c = hid_connected();
   canvas.setFont(&fonts::Font2);
   canvas.setTextDatum(textdatum_t::top_left);
   if (c) {
     canvas.setTextColor(C_ACCENT, C_BG);
     canvas.drawString("connected", 10, LIST_Y);
+    return;
+  }
+  if (g_xport == XPORT_USB) {
+    canvas.setTextColor(C_AMBER, C_BG);
+    canvas.drawString("waiting for USB host", 10, LIST_Y);
   } else {
     canvas.setTextColor(C_AMBER, C_BG);
     canvas.drawString("advertising", 10, LIST_Y);
@@ -470,7 +518,8 @@ static void draw_conn_chip() {
 
 static void draw_kb_screen() {
   canvas.fillSprite(C_BG);
-  draw_statusbar("BLE KEYBOARD");
+  char _t[24]; snprintf(_t, sizeof(_t), "%s KEYBOARD", xport_name());
+  draw_statusbar(_t);
   draw_conn_chip();
   canvas.setFont(&fonts::Font2);
   canvas.setTextDatum(textdatum_t::top_left);
@@ -495,7 +544,8 @@ static void mouse_pill(int x, int y, const char* s, bool on) {
 }
 static void draw_mouse_screen() {
   canvas.fillSprite(C_BG);
-  draw_statusbar("BLE MOUSE");
+  char _t[24]; snprintf(_t, sizeof(_t), "%s MOUSE", xport_name());
+  draw_statusbar(_t);
   draw_conn_chip();
   canvas.setFont(&fonts::Font2);
 
@@ -533,7 +583,8 @@ static void draw_mouse_screen() {
 
 static void draw_pad_screen() {
   canvas.fillSprite(C_BG);
-  draw_statusbar("BLE GAMEPAD");
+  char _t[24]; snprintf(_t, sizeof(_t), "%s GAMEPAD", xport_name());
+  draw_statusbar(_t);
   draw_conn_chip();
   // button pads
   const char* labels[8] = { "A", "B", "X", "Y", "L", "R", "St", "Se" };
@@ -609,17 +660,21 @@ static void move_sel(Menu* m, int delta) {
   }
 }
 
-// BLE radio follows the Control subtree: on when inside it, off otherwise.
+// Radios follow their Control subtree: on when inside it, off otherwise.
 static bool stack_has(Menu* t) {
   for (int i = 0; i <= g_depth; i++) if (g_stack[i] == t) return true;
   return false;
 }
-static void sync_ble() {
-  static bool was = false;
-  bool now = stack_has(&control_menu);
-  if (now && !was) bhid_start("Nexus");
-  if (!now && was) bhid_stop();
-  was = now;
+static void sync_radios() {
+  static bool was_ble = false, was_usb = false;
+  bool nb = stack_has(&control_menu);
+  bool nu = stack_has(&usb_control_menu);
+  if (nb && !was_ble) bhid_start("Nexus");
+  if (!nb && was_ble) bhid_stop();
+  if (nu && !was_usb) uhid_start("Nexus");
+  if (!nu && was_usb) uhid_stop();
+  was_ble = nb;
+  was_usb = nu;
 }
 
 static void enter_item(Menu* m) {
@@ -678,7 +733,7 @@ static void tick_kb() {
   int n = kb_scan_full(h, 8, &shift);
   if (exit_pressed(h, n)) {
     uint8_t empty[6] = {0};
-    bhid_key_report(0, empty);
+    hid_key(0, empty);
     g_prev_n = 0;
     g_prev_held[0] = 0;
     leave_screen();
@@ -710,7 +765,7 @@ static void tick_kb() {
   bool changed = (mod != g_last_mod);
   for (int i = 0; i < 6; i++) if (keys[i] != g_last_keys[i]) changed = true;
   if (changed) {
-    bhid_key_report(mod, keys);
+    hid_key(mod, keys);
     memcpy(g_last_keys, keys, sizeof(keys));
     g_last_mod = mod;
   }
@@ -751,7 +806,7 @@ static void tick_mouse() {
   g_mouse_whl_disp = up ? 1 : (dn ? -1 : 0);
 
   uint8_t nonzero = (dx || dy || btn || whl) ? 1 : 0;
-  if (nonzero || g_mouse_prev) bhid_send_mouse(btn, dx, dy, whl);
+  if (nonzero || g_mouse_prev) hid_mouse(btn, dx, dy, whl);
   g_mouse_prev = nonzero;
 }
 
@@ -759,7 +814,7 @@ static void tick_pad() {
   char h[8];
   int n = kb_scan_full(h, 8, NULL);
   if (exit_pressed(h, n)) {
-    bhid_send_gamepad(0, 0, 0);
+    hid_pad(0, 0, 0);
     leave_screen();
     return;
   }
@@ -778,7 +833,7 @@ static void tick_pad() {
   if (held_has(h, n, ' ')) btns |= 1 << 6;
   if (held_has(h, n, '\n')) btns |= 1 << 7;
   if (btns != g_pad_btns || x != g_pad_x || y != g_pad_y) {
-    bhid_send_gamepad(btns, x, y);
+    hid_pad(btns, x, y);
     g_pad_btns = btns;
     g_pad_x = x;
     g_pad_y = y;
@@ -827,11 +882,14 @@ extern "C" void app_main(void) {
     int new_ble = bhid_active() ? (bhid_connected() ? 2 : 1) : 0;
     bool ble_changed = (new_ble != g_ble_state);
     g_ble_state = new_ble;
+    int new_usb = uhid_active() ? (uhid_connected() ? 2 : 1) : 0;
+    bool usb_changed = (new_usb != g_usb_state);
+    g_usb_state = new_usb;
 
     switch (g_view) {
       case VIEW_MENU: {
         char k = kb_poll();
-        bool dirty = batt_tick || ble_changed;
+        bool dirty = batt_tick || ble_changed || usb_changed;
         if (k) {
           Menu* m = cur();
           switch (k) {
@@ -844,7 +902,7 @@ extern "C" void app_main(void) {
             case '`': g_depth = 0; dirty = true; break;
             default: break;
           }
-          sync_ble();
+          sync_radios();
         }
         if (dirty && g_view == VIEW_MENU) draw_menu(cur(), (float)cur()->sel);
         break;
