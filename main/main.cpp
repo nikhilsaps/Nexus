@@ -188,6 +188,13 @@ static int     g_kblen = 0;
 static uint8_t g_last_keys[6] = {0};
 static uint8_t g_last_mod = 0;
 static uint8_t g_mouse_prev = 0;   // nonzero if last mouse report was nonzero
+static const int8_t MOUSE_SPD[3]      = {4, 8, 16};
+static const char*  MOUSE_SPD_NAME[3] = {"SLOW", "MED", "FAST"};
+static int     g_mouse_spd_i  = 1;     // default MED
+static bool    g_mouse_s_prev = false; // edge-detect speed key
+static uint8_t g_mouse_div    = 0;     // scroll throttle counter
+static uint8_t g_mouse_btn_disp = 0;   // live button state (for pills)
+static int8_t  g_mouse_whl_disp = 0;   // live scroll dir (for pill)
 static uint16_t g_pad_btns = 0;
 static int8_t  g_pad_x = 0, g_pad_y = 0;
 static bool    g_prev_exit = false;
@@ -478,14 +485,46 @@ static void draw_kb_screen() {
   canvas.pushSprite(0, 0);
 }
 
+static void mouse_pill(int x, int y, const char* s, bool on) {
+  const int w = 30, hgt = 18;
+  canvas.fillRoundRect(x, y, w, hgt, 4, on ? C_ACCENT : C_SELBG);
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::middle_center);
+  canvas.setTextColor(on ? C_BG : C_DIM, on ? C_ACCENT : C_SELBG);
+  canvas.drawString(s, x + w / 2, y + hgt / 2);
+}
 static void draw_mouse_screen() {
   canvas.fillSprite(C_BG);
   draw_statusbar("BLE MOUSE");
   draw_conn_chip();
   canvas.setFont(&fonts::Font2);
+
+  // movement + scroll hint
   canvas.setTextDatum(textdatum_t::top_left);
   canvas.setTextColor(C_DIM, C_BG);
-  canvas.drawString(";./,/ move   space=L  m=R", 10, LIST_Y + 22);
+  canvas.drawString("move ;./,/   scroll k/j", 10, LIST_Y + 20);
+
+  // speed readout
+  char sb[16];
+  snprintf(sb, sizeof(sb), "SPD %s", MOUSE_SPD_NAME[g_mouse_spd_i]);
+  canvas.setTextDatum(textdatum_t::top_right);
+  canvas.setTextColor(C_ACCENT, C_BG);
+  canvas.drawString(sb, W - 10, LIST_Y + 20);
+
+  // live button + scroll pills
+  int py = LIST_Y + 44;
+  mouse_pill(10,  py, "L",  g_mouse_btn_disp & 1);
+  mouse_pill(46,  py, "R",  g_mouse_btn_disp & 2);
+  mouse_pill(82,  py, "M",  g_mouse_btn_disp & 4);
+  bool su = g_mouse_whl_disp > 0, sd = g_mouse_whl_disp < 0;
+  mouse_pill(132, py, su ? "UP" : (sd ? "DN" : "WH"), su || sd);
+
+  // key legend
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("L=spc R=m M=n  s=speed", 10, py + 24);
+
   canvas.setTextColor(C_DIM, C_BG);
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.drawString("` exit", 10, H - 4);
@@ -681,19 +720,38 @@ static void tick_mouse() {
   char h[8];
   int n = kb_scan_full(h, 8, NULL);
   if (exit_pressed(h, n)) { leave_screen(); return; }
-  int8_t dx = 0, dy = 0;
+
+  // speed cycle on 's' edge (SLOW -> MED -> FAST)
+  bool s_now = held_has(h, n, 's');
+  if (s_now && !g_mouse_s_prev) g_mouse_spd_i = (g_mouse_spd_i + 1) % 3;
+  g_mouse_s_prev = s_now;
+  int8_t sp = MOUSE_SPD[g_mouse_spd_i];
+
+  int8_t dx = 0, dy = 0, whl = 0;
   uint8_t btn = 0;
-  const int SP = 7;
-  if (held_has(h, n, ';')) dy -= SP;
-  if (held_has(h, n, '.')) dy += SP;
-  if (held_has(h, n, ',')) dx -= SP;
-  if (held_has(h, n, '/')) dx += SP;
-  if (held_has(h, n, ' ')) btn |= 1;
-  if (held_has(h, n, 'm')) btn |= 2;
-  uint8_t nonzero = (dx || dy || btn) ? 1 : 0;
-  if (nonzero || g_mouse_prev) {
-    bhid_send_mouse(btn, dx, dy, 0);
+  if (held_has(h, n, ';')) dy -= sp;
+  if (held_has(h, n, '.')) dy += sp;
+  if (held_has(h, n, ',')) dx -= sp;
+  if (held_has(h, n, '/')) dx += sp;
+  if (held_has(h, n, ' ')) btn |= 1;   // left
+  if (held_has(h, n, 'm')) btn |= 2;   // right
+  if (held_has(h, n, 'n')) btn |= 4;   // middle
+
+  // scroll (throttled ~10/s): k = up, j = down
+  bool up = held_has(h, n, 'k');
+  bool dn = held_has(h, n, 'j');
+  if (up || dn) {
+    if (g_mouse_div == 0) whl = up ? 1 : -1;
+    g_mouse_div = (g_mouse_div + 1) % 6;
+  } else {
+    g_mouse_div = 0;
   }
+
+  g_mouse_btn_disp = btn;
+  g_mouse_whl_disp = up ? 1 : (dn ? -1 : 0);
+
+  uint8_t nonzero = (dx || dy || btn || whl) ? 1 : 0;
+  if (nonzero || g_mouse_prev) bhid_send_mouse(btn, dx, dy, whl);
   g_mouse_prev = nonzero;
 }
 
