@@ -16,6 +16,7 @@
 #include "ble_hid.h"
 #include "usb_hid.h"
 #include "sd_store.h"
+#include "wifi_net.h"
 
 // ---------- Palette (cyberdeck terminal) ----------
 static M5GFX display;
@@ -176,7 +177,7 @@ struct Menu {
 
 // ---------- App views ----------
 enum AppView { VIEW_MENU, VIEW_MSG, VIEW_KB, VIEW_MOUSE, VIEW_PAD, VIEW_FILES,
-                VIEW_FILEACT, VIEW_TEXTIN, VIEW_CONFIRM, VIEW_DUCK, VIEW_DUCKRUN };
+                VIEW_FILEACT, VIEW_TEXTIN, VIEW_CONFIRM, VIEW_DUCK, VIEW_DUCKRUN, VIEW_WIFISCAN, VIEW_WIFISTAT, VIEW_HOTSPOT, VIEW_CAPPICK, VIEW_CAPTIVE };
 static AppView g_view = VIEW_MENU;
 
 // ---------- Transport (BLE vs USB) ----------
@@ -243,6 +244,10 @@ static char        g_sd_info_buf[200];
 #define TIN_RENAME  1
 #define TIN_NEWFILE 2
 #define TIN_NEWDIR  3
+#define TIN_WIFIPASS 4
+#define TIN_APSSID  5
+#define TIN_APPASS  6
+#define TIN_CAPNAME 7
 static const char* g_act_labels[6];
 static int         g_act_codes[6];
 static int         g_act_n   = 0;
@@ -254,6 +259,25 @@ static char        g_rename_old[SD_NAME_MAX];
 static char        g_del_name[SD_NAME_MAX];
 static bool        g_del_isdir = false;
 
+// ---------- WiFi state ----------
+#define WIFI_MAX_AP 32
+static wifi_ap_t*  g_aps = 0;
+static int         g_ap_count = 0;
+static int         g_ap_sel = 0;
+static int         g_ap_top = 0;
+static char        g_wifi_stat[192];
+static char        g_wifi_ssel[WIFI_SSID_MAX];
+static uint8_t     g_wifi_auth = 0;
+static char        g_wifi_pass[64];
+static char        g_ap_ssid[WIFI_SSID_MAX];
+static char        g_ap_pass[64];
+static bool        g_wifi_connected = false;
+static int         g_wifi_inet = -1;   // -1 unknown, 0 no, 1 yes
+static char        g_cap_name[WIFI_SSID_MAX];
+static char*       g_cap_html = 0;
+static int         g_cap_html_len = 0;
+static void        wifi_scan_now();   // defined with the draw helpers
+
 // Build a card-relative path for `name` inside the current g_path.
 static void entry_rel(const char* name, char* out, size_t n) {
   size_t pl = strlen(g_path);
@@ -264,6 +288,10 @@ static void entry_rel(const char* name, char* out, size_t n) {
 static void open_actions();
 static void do_action(int code);
 static void commit_text();
+static void begin_text(int mode, const char* preset);
+static void cap_open_picker();
+static void cap_stop();
+static void cap_cleanup_sd();
 
 // Human-readable byte count: "931", "4.3K", "12M", "7.4G".
 static void fmt_size(uint64_t b, char* out, size_t n) {
@@ -384,6 +412,31 @@ static void act_refresh() {
   show_msg("STORAGE", g_sd_ok ? "Card remounted." : "No card found.");
 }
 
+// ---------- WiFi actions ----------
+static void act_wifi_scan() {
+  if (!wifi_net_running() || !g_aps) {
+    show_msg("WIFI", "WiFi not ready.\nLeave and re-enter\nthe WiFi menu.");
+    return;
+  }
+  g_view = VIEW_WIFISCAN;
+  wifi_scan_now();
+}
+static void act_wifi_heap() {
+  size_t h = wifi_net_free_heap();
+  snprintf(g_wifi_stat, sizeof(g_wifi_stat),
+    "free heap\n%u bytes\n%u KB\nwifi %s",
+    (unsigned)h, (unsigned)(h / 1024), wifi_net_running() ? "running" : "off");
+  show_msg("HEAP", g_wifi_stat);
+}
+static void act_hotspot() {
+  if (!wifi_net_running()) { show_msg("HOTSPOT", "WiFi not ready."); return; }
+  begin_text(TIN_APSSID, "Nexus-AP");
+}
+static void act_captive() {
+  if (!wifi_net_running()) { show_msg("CAPTIVE", "WiFi not ready."); return; }
+  begin_text(TIN_CAPNAME, "Nexus");
+}
+
 // ---------- Menu tree ----------
 static MenuItem control_items[] = {
   { "Keyboard", KIND_ACTION, 0, act_ble_kb, 0, 0 },
@@ -429,13 +482,23 @@ static MenuItem storage_items[] = {
 };
 static Menu storage_menu = { "STORAGE", storage_items, 3, 0, 0 };
 
+// WiFi: scan / connect+test / hotspot (lazy stack; exclusive with BLE+USB).
+static MenuItem wifi_items[] = {
+  { "Scan",      KIND_ACTION, 0, act_wifi_scan, 0, 0 },
+  { "Hotspot",   KIND_ACTION, 0, act_hotspot,   0, 0 },
+  { "Captive",   KIND_ACTION, 0, act_captive,   0, 0 },
+  { "Free Heap", KIND_ACTION, 0, act_wifi_heap, 0, 0 },
+};
+static Menu wifi_menu = { "WIFI", wifi_items, 4, 0, 0 };
+
 static MenuItem root_items[] = {
   { "BLE",      KIND_SUBMENU, &ble_menu,     0, 0, 0 },
   { "USB",      KIND_SUBMENU, &usb_menu,     0, 0, 0 },
   { "Storage",  KIND_SUBMENU, &storage_menu, 0, 0, 0 },
+  { "WiFi",     KIND_SUBMENU, &wifi_menu,    0, 0, 0 },
   { "Settings", KIND_SUBMENU, &set_menu,     0, 0, 0 },
 };
-static Menu root_menu = { "NEXUS", root_items, 4, 0, 0 };
+static Menu root_menu = { "NEXUS", root_items, 5, 0, 0 };
 
 // ---------- Layout ----------
 static const int W = 240, H = 135;
@@ -803,6 +866,23 @@ static void sync_storage() {
   was = now;
 }
 
+static void sync_wifi() {
+  static bool was = false;
+  bool now = stack_has(&wifi_menu);
+  if (now && !was) {
+    if (wifi_net_start() && !g_aps)
+      g_aps = (wifi_ap_t*)malloc(sizeof(wifi_ap_t) * WIFI_MAX_AP);
+  }
+  if (!now && was) {
+    cap_stop();          // no-op if portal not running
+    cap_cleanup_sd();
+    if (g_aps) { free(g_aps); g_aps = 0; }
+    wifi_net_stop();
+    g_ap_count = 0;
+  }
+  was = now;
+}
+
 static void enter_item(Menu* m) {
   MenuItem* it = &m->items[m->sel];
   switch (it->kind) {
@@ -1130,7 +1210,65 @@ static bool name_valid(const char* sname) {
   return true;
 }
 
+static void do_wifi_connect(const char* ssid, const char* pass) {
+  canvas.fillSprite(C_BG);
+  draw_statusbar("WiFi");
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::middle_center);
+  canvas.setTextColor(C_ACCENT, C_BG);
+  canvas.drawString("Connecting to", W / 2, H / 2 - 12);
+  canvas.drawString(ssid, W / 2, H / 2 + 8);
+  canvas.pushSprite(0, 0);
+  g_wifi_connected = (wifi_net_connect(ssid, pass, 12000) == 1);
+  g_wifi_inet = -1;
+  if (g_wifi_connected) {
+    canvas.fillSprite(C_BG);
+    draw_statusbar("WiFi");
+    canvas.setTextDatum(textdatum_t::middle_center);
+    canvas.setTextColor(C_ACCENT, C_BG);
+    canvas.drawString("Checking internet...", W / 2, H / 2);
+    canvas.pushSprite(0, 0);
+    g_wifi_inet = wifi_net_check_internet();
+  }
+  g_view = VIEW_WIFISTAT;
+}
+
+static void do_hotspot_start() {
+  canvas.fillSprite(C_BG);
+  draw_statusbar("Hotspot");
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::middle_center);
+  canvas.setTextColor(C_ACCENT, C_BG);
+  canvas.drawString("Starting AP...", W / 2, H / 2);
+  canvas.pushSprite(0, 0);
+  if (!wifi_net_ap_start(g_ap_ssid, g_ap_pass)) { show_msg("HOTSPOT", "Failed to start AP."); return; }
+  g_view = VIEW_HOTSPOT;
+}
+
+static void commit_wifi_text() {
+  if (g_tin_mode == TIN_WIFIPASS) {
+    strncpy(g_wifi_pass, g_tin, sizeof(g_wifi_pass) - 1);
+    g_wifi_pass[sizeof(g_wifi_pass) - 1] = 0;
+    do_wifi_connect(g_wifi_ssel, g_wifi_pass);
+  } else if (g_tin_mode == TIN_APSSID) {
+    if (!g_tin[0]) { show_msg("HOTSPOT", "Name cannot\nbe empty."); return; }
+    strncpy(g_ap_ssid, g_tin, sizeof(g_ap_ssid) - 1);
+    g_ap_ssid[sizeof(g_ap_ssid) - 1] = 0;
+    begin_text(TIN_APPASS, "");
+  } else if (g_tin_mode == TIN_APPASS) {
+    strncpy(g_ap_pass, g_tin, sizeof(g_ap_pass) - 1);
+    g_ap_pass[sizeof(g_ap_pass) - 1] = 0;
+    do_hotspot_start();
+  } else if (g_tin_mode == TIN_CAPNAME) {
+    if (!g_tin[0]) { show_msg("CAPTIVE", "Name cannot\nbe empty."); return; }
+    strncpy(g_cap_name, g_tin, sizeof(g_cap_name) - 1);
+    g_cap_name[sizeof(g_cap_name) - 1] = 0;
+    cap_open_picker();
+  }
+}
+
 static void commit_text() {
+  if (g_tin_mode >= TIN_WIFIPASS) { commit_wifi_text(); return; }
   if (!name_valid(g_tin)) { show_msg("NAME", "Invalid name.\nNo / or backslash,\nnot empty."); return; }
   char rel[400];
   bool ok = false;
@@ -1188,8 +1326,11 @@ static void tick_fileact() {
 
 static void draw_textin() {
   canvas.fillSprite(C_BG);
-  const char* ttl = (g_tin_mode == TIN_RENAME)  ? "Rename"
-                  : (g_tin_mode == TIN_NEWFILE) ? "New File" : "New Folder";
+  const char* ttl = (g_tin_mode == TIN_RENAME)   ? "Rename"
+                  : (g_tin_mode == TIN_NEWFILE)  ? "New File"
+                  : (g_tin_mode == TIN_NEWDIR)   ? "New Folder"
+                  : (g_tin_mode == TIN_WIFIPASS) ? "WiFi Password"
+                  : (g_tin_mode == TIN_APSSID)   ? "Hotspot Name" : "Hotspot Pass";
   draw_statusbar(ttl);
   canvas.setFont(&fonts::Font2);
   canvas.setTextDatum(textdatum_t::top_left);
@@ -1216,12 +1357,15 @@ static void tick_textin() {
     bool was = false;
     for (int j = 0; j < g_prev_n; j++) if (g_prev_held[j] == c) { was = true; break; }
     if (was) continue;
-    if (c == '`') { g_prev_n = 0; g_prev_held[0] = 0; g_view = VIEW_FILEACT; return; }
+    if (c == '`') { g_prev_n = 0; g_prev_held[0] = 0;
+      g_view = (g_tin_mode == TIN_WIFIPASS) ? VIEW_WIFISCAN
+             : (g_tin_mode >= TIN_APSSID)   ? VIEW_MENU : VIEW_FILEACT;
+      return; }
     if (c == '\n' || c == '\r') { memcpy(g_prev_held, h, n); g_prev_n = n; commit_text(); return; }
     if (c == 0x08) { if (g_tin_len > 0) g_tin[--g_tin_len] = 0; continue; }
     if (c == '\t') continue;
     if ((unsigned char)c < 0x20) continue;
-    if (c == '/' || c == '\\') continue;
+    if (g_tin_mode < TIN_WIFIPASS && (c == '/' || c == '\\')) continue;
     char e = c;
     if (shift && e >= 'a' && e <= 'z') e = e - 'a' + 'A';
     if (g_tin_len < SD_NAME_MAX - 1) { g_tin[g_tin_len++] = e; g_tin[g_tin_len] = 0; }
@@ -1531,6 +1675,357 @@ static void tick_duckrun() {
   }
 }
 
+// ---------- WiFi screens ----------
+static int rssi_bars(int r) {
+  if (r >= -55) return 4;
+  if (r >= -65) return 3;
+  if (r >= -75) return 2;
+  if (r >= -85) return 1;
+  return 0;
+}
+
+static void wifi_scan_now() {
+  if (!g_aps) return;
+  canvas.fillSprite(C_BG);
+  draw_statusbar("WiFi Scan");
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::middle_center);
+  canvas.setTextColor(C_ACCENT, C_BG);
+  canvas.drawString("Scanning...", W / 2, H / 2);
+  canvas.pushSprite(0, 0);
+  g_ap_count = wifi_net_scan(g_aps, WIFI_MAX_AP);
+  g_ap_sel = 0; g_ap_top = 0;
+}
+
+static void draw_wifiscan() {
+  canvas.fillSprite(C_BG);
+  char title[24];
+  snprintf(title, sizeof(title), "WiFi (%d)", g_ap_count);
+  draw_statusbar(title);
+  canvas.setFont(&fonts::Font2);
+  if (g_ap_count == 0) {
+    canvas.setTextDatum(textdatum_t::middle_center);
+    canvas.setTextColor(C_DIM, C_BG);
+    canvas.drawString("no networks - r to scan", W / 2, H / 2);
+    canvas.pushSprite(0, 0);
+    return;
+  }
+  for (int i = 0; i < VIS && g_ap_top + i < g_ap_count; i++) {
+    int idx = g_ap_top + i;
+    int y = LIST_Y + i * ROW_H;
+    bool sel = (idx == g_ap_sel);
+    if (sel) canvas.fillRoundRect(4, y, W - 8, ROW_H - 2, 3, C_SELBG);
+    wifi_ap_t* a = &g_aps[idx];
+    bool open = (a->authmode == 0);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.setTextColor(open ? C_TEXT : C_AMBER, sel ? C_SELBG : C_BG);
+    canvas.drawString(a->ssid, 14, y + 3);
+    int bx = W - 44, by = y + 4;
+    int bars = rssi_bars(a->rssi);
+    for (int b = 0; b < 4; b++) {
+      int bh = 4 + b * 3;
+      uint16_t col = (b < bars) ? C_ACCENT : C_DIM;
+      canvas.fillRect(bx + b * 5, by + (13 - bh), 3, bh, col);
+    }
+  }
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("ret join  i info  r scan", 8, H - 2);
+  canvas.pushSprite(0, 0);
+}
+
+static void tick_wifiscan() {
+  char k = kb_poll();
+  if (!k) return;
+  switch (k) {
+    case ';':
+      if (g_ap_sel > 0) { g_ap_sel--; if (g_ap_sel < g_ap_top) g_ap_top = g_ap_sel; }
+      break;
+    case '.':
+      if (g_ap_sel < g_ap_count - 1) {
+        g_ap_sel++;
+        if (g_ap_sel >= g_ap_top + VIS) g_ap_top = g_ap_sel - VIS + 1;
+      }
+      break;
+    case 'r': case 'R':
+      wifi_scan_now();
+      break;
+    case 'i': case 'I': {
+      if (g_ap_count == 0) break;
+      wifi_ap_t* a = &g_aps[g_ap_sel];
+      snprintf(g_wifi_stat, sizeof(g_wifi_stat),
+        "%s\nbssid %02X:%02X:%02X:%02X:%02X:%02X\nch %d  %s  %d dBm",
+        a->ssid, a->bssid[0], a->bssid[1], a->bssid[2],
+        a->bssid[3], a->bssid[4], a->bssid[5],
+        a->channel, wifi_net_auth_str(a->authmode), a->rssi);
+      show_msg("NETWORK", g_wifi_stat);
+      break;
+    }
+    case '/': case '\n': case '\r': {
+      if (g_ap_count == 0) break;
+      wifi_ap_t* a = &g_aps[g_ap_sel];
+      strncpy(g_wifi_ssel, a->ssid, sizeof(g_wifi_ssel) - 1);
+      g_wifi_ssel[sizeof(g_wifi_ssel) - 1] = 0;
+      g_wifi_auth = a->authmode;
+      if (a->authmode == 0) { g_wifi_pass[0] = 0; do_wifi_connect(g_wifi_ssel, g_wifi_pass); }
+      else begin_text(TIN_WIFIPASS, "");
+      break;
+    }
+    case ',': case '`':
+      leave_screen();
+      break;
+    default: break;
+  }
+}
+
+static void draw_wifistat() {
+  canvas.fillSprite(C_BG);
+  draw_statusbar("WiFi Status");
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  int y = LIST_Y;
+  if (!g_wifi_connected) {
+    canvas.setTextColor(C_RED, C_BG);
+    canvas.drawString("Connect failed", 10, y);
+    canvas.setTextColor(C_TEXT, C_BG);
+    canvas.drawString(g_wifi_ssel, 10, y + 20);
+    canvas.setTextColor(C_DIM, C_BG);
+    canvas.drawString("wrong password?", 10, y + 42);
+    canvas.setTextDatum(textdatum_t::bottom_left);
+    canvas.drawString(", back", 8, H - 2);
+    canvas.pushSprite(0, 0);
+    return;
+  }
+  char ip[16] = {0}, gw[16] = {0};
+  wifi_net_sta_ipinfo(ip, gw, 16);
+  int rssi = wifi_net_rssi();
+  char l[40];
+  canvas.setTextColor(C_TEXT, C_BG);
+  canvas.drawString(g_wifi_ssel, 10, y);
+  canvas.setTextColor(C_DIM, C_BG);
+  snprintf(l, sizeof(l), "ip  %s", ip); canvas.drawString(l, 10, y + 18);
+  snprintf(l, sizeof(l), "gw  %s", gw); canvas.drawString(l, 10, y + 34);
+  canvas.setTextColor(C_ACCENT, C_BG);
+  snprintf(l, sizeof(l), "rssi %d dBm", rssi); canvas.drawString(l, 10, y + 52);
+  int bars = rssi_bars(rssi);
+  for (int b = 0; b < 4; b++) {
+    int bh = 4 + b * 3;
+    uint16_t col = (b < bars) ? C_ACCENT : C_DIM;
+    canvas.fillRect(150 + b * 6, y + 52 + (13 - bh), 4, bh, col);
+  }
+  const char* v = (g_wifi_inet == 1) ? "Internet: YES"
+                : (g_wifi_inet == 0) ? "Internet: NO" : "Internet: ?";
+  canvas.setTextColor((g_wifi_inet == 1) ? C_ACCENT
+                    : (g_wifi_inet == 0) ? C_RED : C_DIM, C_BG);
+  canvas.drawString(v, 10, y + 70);
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("r test  t time  d disc  , back", 8, H - 2);
+  canvas.pushSprite(0, 0);
+}
+
+static void tick_wifistat() {
+  char k = kb_poll();
+  if (!k) return;
+  switch (k) {
+    case 'r': case 'R': {
+      canvas.fillSprite(C_BG);
+      draw_statusbar("WiFi");
+      canvas.setFont(&fonts::Font2);
+      canvas.setTextDatum(textdatum_t::middle_center);
+      canvas.setTextColor(C_ACCENT, C_BG);
+      canvas.drawString("Checking internet...", W / 2, H / 2);
+      canvas.pushSprite(0, 0);
+      g_wifi_inet = g_wifi_connected ? wifi_net_check_internet() : -1;
+      break;
+    }
+    case 't': case 'T': {
+      if (!g_wifi_connected) break;
+      canvas.fillSprite(C_BG);
+      draw_statusbar("WiFi");
+      canvas.setFont(&fonts::Font2);
+      canvas.setTextDatum(textdatum_t::middle_center);
+      canvas.setTextColor(C_ACCENT, C_BG);
+      canvas.drawString("Syncing time...", W / 2, H / 2);
+      canvas.pushSprite(0, 0);
+      if (wifi_net_sntp_sync(g_wifi_stat, sizeof(g_wifi_stat)))
+        show_msg("NTP TIME", g_wifi_stat);
+      else
+        show_msg("NTP TIME", "Sync failed.\nNo internet or\nNTP blocked.");
+      break;
+    }
+    case 'd': case 'D':
+      wifi_net_disconnect();
+      g_wifi_connected = false;
+      g_view = VIEW_WIFISCAN;
+      wifi_scan_now();
+      break;
+    case ',': case '`':
+      g_view = VIEW_WIFISCAN;
+      break;
+    default: break;
+  }
+}
+
+static void draw_hotspot() {
+  canvas.fillSprite(C_BG);
+  draw_statusbar("Hotspot ON");
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  int y = LIST_Y;
+  char ip[16] = {0};
+  wifi_net_ap_ipinfo(ip, 16);
+  int cl = wifi_net_ap_clients();
+  bool open = (strlen(g_ap_pass) < 8);
+  char l[80];
+  canvas.setTextColor(C_TEXT, C_BG);
+  snprintf(l, sizeof(l), "ssid %s", g_ap_ssid); canvas.drawString(l, 10, y);
+  canvas.setTextColor(C_DIM, C_BG);
+  snprintf(l, sizeof(l), "pass %s", open ? "(open)" : g_ap_pass); canvas.drawString(l, 10, y + 18);
+  snprintf(l, sizeof(l), "ip   %s", ip); canvas.drawString(l, 10, y + 34);
+  canvas.setTextColor(C_ACCENT, C_BG);
+  snprintf(l, sizeof(l), "clients  %d", cl); canvas.drawString(l, 10, y + 54);
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("d stop   , back", 8, H - 2);
+  canvas.pushSprite(0, 0);
+}
+
+static void tick_hotspot() {
+  char k = kb_poll();
+  if (!k) return;
+  if (k == 'd' || k == 'D' || k == ',' || k == '`') {
+    wifi_net_ap_stop();
+    g_view = VIEW_MENU;
+    g_last = k;
+  }
+}
+
+// ======================= CAPTIVE PORTAL =======================
+#define CAP_MAX      64
+#define CAP_HTML_MAX 24576
+static sd_entry_t* g_cap = 0;
+static int  g_cap_count = 0, g_cap_sel = 0, g_cap_top = 0;
+static bool g_cap_sd = false;
+
+static bool ends_html(const char* n) {
+  size_t l = strlen(n);
+  return (l > 5 && !strcasecmp(n + l - 5, ".html")) ||
+         (l > 4 && !strcasecmp(n + l - 4, ".htm"));
+}
+
+static void cap_cleanup_sd() {
+  if (g_cap) { free(g_cap); g_cap = 0; }
+  if (g_cap_sd) { sd_unmount(); g_cap_sd = false; }
+}
+
+static void cap_open_picker() {
+  g_cap_count = 0; g_cap_sel = 0; g_cap_top = 0;
+  g_cap_sd = sd_mount();
+  if (!g_cap_sd) { show_msg("CAPTIVE", "No SD card.\nNeed /captive/*.html"); return; }
+  sd_make_dir("/captive");
+  if (!g_cap) g_cap = (sd_entry_t*)malloc(sizeof(sd_entry_t) * CAP_MAX);
+  if (!g_cap) { cap_cleanup_sd(); show_msg("CAPTIVE", "Out of memory."); return; }
+  bool t; int n = sd_list("/captive", g_cap, CAP_MAX, &t);
+  int w = 0;
+  for (int i = 0; i < n; i++)
+    if (!g_cap[i].is_dir && ends_html(g_cap[i].name)) { if (w != i) g_cap[w] = g_cap[i]; w++; }
+  g_cap_count = w;
+  g_view = VIEW_CAPPICK;
+}
+
+static void cap_launch(int idx) {
+  if (idx < 0 || idx >= g_cap_count) return;
+  char path[128];
+  snprintf(path, sizeof(path), "/captive/%s", g_cap[idx].name);
+  if (!g_cap_html) g_cap_html = (char*)malloc(CAP_HTML_MAX);
+  if (!g_cap_html) { cap_cleanup_sd(); show_msg("CAPTIVE", "Out of memory."); return; }
+  int r = sd_read_file(path, g_cap_html, CAP_HTML_MAX);
+  cap_cleanup_sd();                 // page is in RAM now; release SD + list
+  if (r < 0) { free(g_cap_html); g_cap_html = 0; show_msg("CAPTIVE", "Read failed."); return; }
+  g_cap_html_len = r;
+  if (!wifi_net_cp_start(g_cap_name, g_cap_html, g_cap_html_len)) {
+    free(g_cap_html); g_cap_html = 0;
+    show_msg("CAPTIVE", "Failed to start\ncaptive portal.");
+    return;
+  }
+  g_view = VIEW_CAPTIVE;
+}
+
+static void cap_stop() {
+  wifi_net_cp_stop();          // safe even if portal was never started
+  if (g_cap_html) { free(g_cap_html); g_cap_html = 0; }
+  g_cap_html_len = 0;
+}
+
+static void draw_cappick() {
+  canvas.fillSprite(C_BG);
+  draw_statusbar("Captive: page");
+  canvas.setFont(&fonts::Font2);
+  if (g_cap_count == 0) {
+    canvas.setTextColor(C_DIM, C_BG);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.drawString("no pages in /captive", 12, LIST_Y + 4);
+    canvas.drawString("add .html files", 12, LIST_Y + 26);
+  }
+  for (int i = 0; i < VIS; i++) {
+    int idx = g_cap_top + i;
+    if (idx >= g_cap_count) break;
+    int y = LIST_Y + i * ROW_H;
+    bool sel = (idx == g_cap_sel);
+    if (sel) canvas.fillRoundRect(4, y, W - 8, ROW_H - 2, 3, C_SELBG);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.setTextColor(C_TEXT, sel ? C_SELBG : C_BG);
+    canvas.drawString(g_cap[idx].name, 12, y + 3);
+  }
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("ret start   , back", 8, H - 2);
+  canvas.pushSprite(0, 0);
+}
+
+static void tick_cappick() {
+  char k = kb_poll();
+  if (!k) return;
+  switch (k) {
+    case ';': if (g_cap_sel > 0) g_cap_sel--; if (g_cap_sel < g_cap_top) g_cap_top = g_cap_sel; break;
+    case '.': if (g_cap_sel < g_cap_count - 1) g_cap_sel++; if (g_cap_sel >= g_cap_top + VIS) g_cap_top = g_cap_sel - VIS + 1; break;
+    case '/': case '\n': case '\r': if (g_cap_count > 0) cap_launch(g_cap_sel); break;
+    case ',': case '`': cap_cleanup_sd(); g_view = VIEW_MENU; g_last = k; break;
+    default: break;
+  }
+}
+
+static void draw_captive() {
+  canvas.fillSprite(C_BG);
+  draw_statusbar("Captive ON");
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  int y = LIST_Y;
+  char l[48];
+  canvas.setTextColor(C_TEXT, C_BG);
+  snprintf(l, sizeof(l), "ssid %s", g_cap_name); canvas.drawString(l, 10, y);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("ip   192.168.4.1", 10, y + 18);
+  canvas.setTextColor(C_ACCENT, C_BG);
+  snprintf(l, sizeof(l), "clients  %d", wifi_net_ap_clients()); canvas.drawString(l, 10, y + 38);
+  snprintf(l, sizeof(l), "hits     %d", wifi_net_cp_hits());    canvas.drawString(l, 10, y + 56);
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("d stop   , back", 8, H - 2);
+  canvas.pushSprite(0, 0);
+}
+
+static void tick_captive() {
+  char k = kb_poll();
+  if (!k) return;
+  if (k == 'd' || k == 'D' || k == ',' || k == '`') {
+    cap_stop();
+    g_view = VIEW_MENU;
+    g_last = k;
+  }
+}
+
 // ---------- Main ----------
 extern "C" void app_main(void) {
   esp_err_t e = nvs_flash_init();
@@ -1595,6 +2090,7 @@ extern "C" void app_main(void) {
           }
           sync_radios();
           sync_storage();
+          sync_wifi();
         }
         if (dirty && g_view == VIEW_MENU) draw_menu(cur(), (float)cur()->sel);
         break;
@@ -1614,6 +2110,12 @@ extern "C" void app_main(void) {
       case VIEW_CONFIRM: tick_confirm(); if (g_view == VIEW_CONFIRM) draw_confirm(); break;
       case VIEW_DUCK:    tick_duck();    if (g_view == VIEW_DUCK)    draw_duck();    break;
       case VIEW_DUCKRUN: tick_duckrun(); if (g_view == VIEW_DUCKRUN) draw_duckrun(); break;
+      case VIEW_WIFISCAN: tick_wifiscan(); if (g_view == VIEW_WIFISCAN) draw_wifiscan(); break;
+      case VIEW_WIFISTAT: tick_wifistat(); if (g_view == VIEW_WIFISTAT) draw_wifistat(); break;
+      case VIEW_HOTSPOT:  tick_hotspot();  if (g_view == VIEW_HOTSPOT)  draw_hotspot();  break;
+      case VIEW_CAPPICK:  tick_cappick();  if (g_view == VIEW_CAPPICK)  draw_cappick();  break;
+      case VIEW_CAPTIVE:  tick_captive();  if (g_view == VIEW_CAPTIVE)  draw_captive();  break;
+      default: break;
     }
     vTaskDelay(pdMS_TO_TICKS(16));
   }

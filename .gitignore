@@ -7,10 +7,11 @@ sdkconfig.old
 *.elf
 *.map
 
-# ---- Docs policy: only README.md is published to GitHub ----
+# ---- Docs policy: README.md and DEVLOG.md are published to GitHub ----
 # STEERING.md / FEATURE.md / HARDWARE.md stay local.
 *.md
 !README.md
+!DEVLOG.md
 
 # ---- misc ----
 .DS_Store
