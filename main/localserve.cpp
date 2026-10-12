@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "sniffer.h"
 
 static const char* TAG = "localserve";
 #define SITES_ROOT  "/sdcard/sites"
@@ -87,6 +88,7 @@ static esp_err_t get_handler(httpd_req_t* req) {
     httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "nope"); return ESP_OK;
   }
   if (url[0] == 0 || (url[0] == '/' && url[1] == 0)) strlcpy(url, "/index.html", PATH_MAX_);
+  else { size_t ul = strlen(url); if (ul && url[ul-1] == '/') strlcat(url, "index.html", PATH_MAX_); }  // dir index
 
   snprintf(fs, PATH_MAX_,  SITES_ROOT "%s",    url);
   snprintf(gz, PATHGZ_MAX_, SITES_ROOT "%s.gz", url);
@@ -146,22 +148,38 @@ static esp_err_t save_handler(httpd_req_t* req) {
   return ESP_OK;
 }
 
+// GET /api/sniff.json : live WiFi-sniffer table, straight from RAM (never SD).
+static esp_err_t sniff_handler(httpd_req_t* req) {
+  const size_t cap = 10240;  // 48 devices * ~170 bytes/row + header
+  char* buf = (char*)malloc(cap);
+  if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_OK; }
+  int n = sniffer_json(buf, cap);
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_send(req, buf, n);
+  free(buf);
+  return ESP_OK;
+}
+
 bool ls_http_start(void) {
   if (g_srv) return true;
   httpd_config_t hc        = HTTPD_DEFAULT_CONFIG();
   hc.uri_match_fn          = httpd_uri_match_wildcard;
   hc.stack_size            = 10240;   // FATFS/SPI + heap path bufs need headroom
   hc.lru_purge_enable      = true;
-  hc.max_uri_handlers      = 4;
+  hc.max_uri_handlers      = 5;
   hc.recv_wait_timeout     = 10;
   hc.send_wait_timeout     = 10;
   if (httpd_start(&g_srv, &hc) != ESP_OK) { g_srv = 0; return false; }
 
   httpd_uri_t save_put  = {}; save_put.uri = "/api/save/*"; save_put.method = HTTP_PUT;  save_put.handler = save_handler;
   httpd_uri_t save_post = {}; save_post.uri = "/api/save/*"; save_post.method = HTTP_POST; save_post.handler = save_handler;
+  httpd_uri_t sniff     = {}; sniff.uri  = "/api/sniff.json"; sniff.method = HTTP_GET; sniff.handler = sniff_handler;
   httpd_uri_t getall    = {}; getall.uri = "/*";          getall.method = HTTP_GET;  getall.handler = get_handler;
   httpd_register_uri_handler(g_srv, &save_put);
   httpd_register_uri_handler(g_srv, &save_post);
+  httpd_register_uri_handler(g_srv, &sniff);
   httpd_register_uri_handler(g_srv, &getall);
   ESP_LOGI(TAG, "LocalServe httpd started (root %s)", SITES_ROOT);
   return true;

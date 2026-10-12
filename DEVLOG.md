@@ -17,9 +17,10 @@ Last updated: 2026-10-13.
 | Die-temperature readout in status bar | done, verified 33C (toggle + 2/5/10/30/60s rate, NVS-saved) |
 | Wi-Fi: NTP clock sync | done |
 | Wi-Fi: Hotspot (SoftAP) | done |
-| Wi-Fi: Captive portal (DNS + HTTP, page from `/captive`) | done |
+| Wi-Fi: Evil-Twin (scan + clone SSID, DNS + HTTP, page from `/captive`) | done, verified |
 | LocalServe: Wireless (SD-hosted static sites over Wi-Fi) | done, verified |
 | LocalServe: Wired (SD-hosted static sites over USB-CDC-NCM) | done, verified |
+| Wi-Fi Sniffer (promiscuous probe/client logger, served as live JSON over NCM) | done, built |
 
 ## Design principles (do not break these)
 
@@ -68,8 +69,8 @@ NEXUS (root)
   BLE       -> Control (Keyboard/Mouse/Gamepad), Duck, Forget Bonds, Info
   USB       -> Control (Keyboard/Mouse/Gamepad), Duck
   Storage   -> Browse, Card Info, Refresh
-  WiFi      -> Scan, Hotspot, Captive, Free Heap
-  LocalServe-> Wireless (WiFi), Wired (USB-NCM)
+  WiFi      -> Scan, Hotspot, Evil-Twin, Free Heap
+  LocalServe-> Wireless (WiFi), Wired (USB-NCM), Sniffer (NCM)
   Settings  -> Logging, Animation, Temp Bar (on/off),
                Temp Rate (2/5/10/30/60 s), Temp Debug, About
 ```
@@ -80,12 +81,14 @@ NEXUS (root)
 - `/captive/*.html` - captive-portal pages (folder auto-created on first use).
 - `/sites/`         - static site(s) LocalServe hosts over the LAN (put an
                       `index.html` here; subfolders and assets are served too).
+- `/sites/sniff/`   - the Wi-Fi Sniffer dashboard (`index.html`); captured data
+                      itself stays in RAM and is never written to the card.
 
 ## AppView states
 
 `VIEW_MENU, VIEW_MSG, VIEW_KB, VIEW_MOUSE, VIEW_PAD, VIEW_FILES, VIEW_FILEACT,
 VIEW_TEXTIN, VIEW_CONFIRM, VIEW_DUCK, VIEW_DUCKRUN, VIEW_WIFISCAN, VIEW_WIFISTAT,
-VIEW_HOTSPOT, VIEW_CAPPICK, VIEW_CAPTIVE`
+VIEW_HOTSPOT, VIEW_CAPPICK, VIEW_CAPTIVE, VIEW_SNIFF`
 
 The on-screen text-entry (`VIEW_TEXTIN`) is shared: `g_tin_mode` selects the
 purpose (file rename/new, Wi-Fi password, hotspot SSID/pass, captive name) and
@@ -135,5 +138,31 @@ esp_driver_sdspi, esp_wifi, esp_netif, lwip, esp_http_server.
   status screen).
 - Optional second ESP32-C3 as an ESP-AT Wi-Fi co-processor over UART, to allow
   simultaneous Wi-Fi + BLE/USB (would lift the mutual-exclusivity limit).
-- "Lab only" offensive Wi-Fi modes (deauth, beacon spam, packet sniffer, Evil
-  Twin) - intentionally deferred; use only on networks you own/are authorized.
+- "Lab only" offensive Wi-Fi modes: deauth and beacon spam still deferred.
+  Evil-Twin (SSID-clone captive) and the passive packet sniffer are now built;
+  use only on networks/devices you own or are authorized to test.
+
+## Wi-Fi Sniffer notes (2026-10-13)
+
+- `sniffer.cpp`: promiscuous mode + a periodic `esp_timer` hopping channels
+  1-13 (250 ms dwell). The promiscuous callback runs in the Wi-Fi task, so it
+  only parses the 802.11 header (type/subtype, addr2, SSID IE) and drops a
+  record into a 48-entry LRU table under a `portMUX` spinlock - no SD, no heavy
+  work in the callback. `sniffer_json()` snapshots the table under the lock,
+  then serialises outside it.
+- Assumes `wifi_net_start()` has inited the stack (LocalServe subtree does
+  this); the sniffer owns `set_mode(STA)/start/promiscuous/set_channel`.
+  Teardown (`sniffer_stop`) runs before `wifi_net_stop` in `sync_localserve`.
+- Served over USB-NCM so the radio stays free to hop while USB carries HTTP
+  (separate hardware - the one combination of promiscuous + httpd that does
+  NOT fight over the radio/channel). `/api/sniff.json` lives in `localserve.cpp`;
+  the viewer page is a normal SD asset (editable without reflashing).
+
+## Evil-Twin notes (2026-10-13)
+
+- Renamed from "Captive". `act_eviltwin()` runs a Wi-Fi scan; selecting an AP
+  copies its SSID into the open captive AP name, then opens the `/captive` page
+  picker. Internal enum names (`VIEW_CAPTIVE`/`VIEW_CAPPICK`) and the `/captive`
+  SD path are unchanged; only the user-facing strings and the clone step are new.
+- Verified on hardware: clones a chosen SSID and serves the page. Auto-join is
+  limited by design (open-vs-WPA2 mismatch, no deauth) - expected, not a bug.

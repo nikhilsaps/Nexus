@@ -26,7 +26,7 @@ lwIP** for networking.
 | **USB HID**   | The same three controllers over a native USB-C cable (no pairing). |
 | **Ducky**     | Runs DuckyScript payloads from the SD card over either BLE or USB. |
 | **Storage**   | Browse / create / rename / delete files and folders on a microSD card. |
-| **Wi-Fi**     | Scan networks, join one and verify real internet, run a hotspot, or host a captive portal. Plus a live signal meter and NTP clock sync. |
+| **Wi-Fi**     | Scan networks, join one and verify real internet, run a hotspot, host a captive/Evil-Twin portal, or passively sniff nearby probes/clients. Plus a live signal meter and NTP clock sync. |
 | **LocalServe** | Host static sites straight off the SD card - over Wi-Fi or a plain USB-C cable (USB-NCM). The Cardputer becomes a tiny web host. |
 
 Everything is **lazy and mutually exclusive**: a radio or the SD card is powered
@@ -113,11 +113,13 @@ mutually exclusive with BLE/USB by design.
   `r` re-tests, `t` syncs the clock over **NTP**, `d` disconnects.
 - **Hotspot** - a SoftAP with a name and password you choose (8+ chars = WPA2,
   blank = open). Shows the SSID, password, AP IP and a live client count.
-- **Captive Portal** - choose a hotspot name, then pick an `.html` page from the
-  `/captive` folder on the SD card. Nexus starts an open AP with that name, a
-  DNS catch-all (every lookup resolves to the device), and a web server that
-  serves your page to anyone who joins - so phones auto-pop the "sign in to
-  network" page. Live clients + page-hit counters.
+- **Evil-Twin** - scan nearby Wi-Fi, pick a network to **clone its SSID**, then
+  choose an `.html` page from the `/captive` folder. Nexus stands up an open AP
+  with the cloned name, a DNS catch-all (every lookup resolves to the device),
+  and a web server that serves your page to anyone who joins. Live clients +
+  page-hit counters. (A device auto-joins only if the real network it trusts was
+  itself open; same-name WPA2 networks will not downgrade, and Nexus has no
+  deauth. Lab/own-gear use only.)
 
 ### LocalServe
 
@@ -142,6 +144,23 @@ A **Temp Debug** item under `Settings` reports the raw temperature-sensor
 install / enable / read return codes - handy when bringing up new hardware.
 
 ---
+
+### Wi-Fi Sniffer (probe / client logger)
+
+A passive sniffer under **LocalServe -> Sniffer (NCM)**. The radio goes into
+promiscuous mode and hops channels 1-13, logging nearby devices into a small
+RAM table: probe requests (phones searching for saved network names), beacons /
+APs, and connected data clients - each with MAC, SSID, RSSI, channel, hit count
+and age. **Nothing is written to the SD** (metadata only; payloads are
+encrypted and never captured).
+
+The data is served over the **USB-NCM** link - radio and USB are separate
+hardware, so the radio stays free to hop channels while USB carries the HTTP.
+A `/api/sniff.json` endpoint streams the live table from RAM; the viewer page
+at `/sites/sniff/index.html` on the SD polls it once a second and shows a
+sortable table with CSV / JSON download. Open `http://192.168.7.1/sniff/` on
+the wired PC. (Receive-only and lawful; the Evil-Twin step is the active part -
+own gear only.)
 
 ## Hardware
 
@@ -203,6 +222,7 @@ Nexus/
                         captive portal (HTTP + DNS), NTP
     localserve.cpp/.h   SD-hosted static web server (/sites over the LAN)
     usb_net.cpp/.h      USB-CDC-NCM adapter + esp_netif gateway + DHCP (Wired)
+    sniffer.cpp/.h      promiscuous Wi-Fi sniffer + probe/client logger (RAM)
 ```
 
 ---

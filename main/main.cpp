@@ -20,6 +20,7 @@
 #include "wifi_net.h"
 #include "localserve.h"
 #include "usb_net.h"
+#include "sniffer.h"
 
 // ---------- Palette (cyberdeck terminal) ----------
 static M5GFX display;
@@ -181,7 +182,7 @@ struct Menu {
 
 // ---------- App views ----------
 enum AppView { VIEW_MENU, VIEW_MSG, VIEW_KB, VIEW_MOUSE, VIEW_PAD, VIEW_FILES,
-                VIEW_FILEACT, VIEW_TEXTIN, VIEW_CONFIRM, VIEW_DUCK, VIEW_DUCKRUN, VIEW_WIFISCAN, VIEW_WIFISTAT, VIEW_HOTSPOT, VIEW_CAPPICK, VIEW_CAPTIVE };
+                VIEW_FILEACT, VIEW_TEXTIN, VIEW_CONFIRM, VIEW_DUCK, VIEW_DUCKRUN, VIEW_WIFISCAN, VIEW_WIFISTAT, VIEW_HOTSPOT, VIEW_CAPPICK, VIEW_CAPTIVE, VIEW_SNIFF };
 static AppView g_view = VIEW_MENU;
 
 // ---------- Transport (BLE vs USB) ----------
@@ -309,6 +310,7 @@ static char        g_ap_pass[64];
 static bool        g_wifi_connected = false;
 static int         g_wifi_inet = -1;   // -1 unknown, 0 no, 1 yes
 static bool        g_serve_mode = false;  // true = this WiFi session is a LocalServe host
+static bool        g_evil_mode  = false;  // true = scan pick clones SSID into the open AP (Evil-Twin)
 static char        g_cap_name[WIFI_SSID_MAX];
 static char*       g_cap_html = 0;
 static int         g_cap_html_len = 0;
@@ -478,6 +480,7 @@ static void act_wifi_scan() {
     return;
   }
   g_serve_mode = false;   // plain scan, not a LocalServe session
+  g_evil_mode  = false;
   g_view = VIEW_WIFISCAN;
   wifi_scan_now();
 }
@@ -492,9 +495,16 @@ static void act_hotspot() {
   if (!wifi_net_running()) { show_msg("HOTSPOT", "WiFi not ready."); return; }
   begin_text(TIN_APSSID, "Nexus-AP");
 }
-static void act_captive() {
-  if (!wifi_net_running()) { show_msg("CAPTIVE", "WiFi not ready."); return; }
-  begin_text(TIN_CAPNAME, "Nexus");
+static void act_eviltwin() {
+  if (!wifi_net_running() || !g_aps) {
+    show_msg("EVIL-TWIN", "WiFi not ready.\nLeave and re-enter\nthe WiFi menu.");
+    return;
+  }
+  // Scan, then the picked network's SSID becomes the open AP name.
+  g_serve_mode = false;
+  g_evil_mode  = true;
+  g_view = VIEW_WIFISCAN;
+  wifi_scan_now();
 }
 
 // ---------- LocalServe actions ----------
@@ -506,6 +516,7 @@ static void act_ls_wireless() {
     return;
   }
   g_serve_mode = true;
+  g_evil_mode  = false;
   g_view = VIEW_WIFISCAN;
   wifi_scan_now();
 }
@@ -525,6 +536,17 @@ static void act_ls_wired() {
     up ? "Serving /sites at\nhttp://%s/\n\nPlug USB into a PC;\na wired adapter\nappears."
        : "Server start FAILED.\nCard not mounted?\n(%s)", ip);
   show_msg("LOCALSERVE", g_wifi_stat);
+}
+// Sniffer: USB-NCM up + promiscuous WiFi capture, served as live JSON. The
+// radio hops channels while USB carries HTTP (separate hardware, they coexist).
+// Captured data stays in RAM; only the viewer page lives on SD (/sites/sniff/).
+static void act_ls_sniffer() {
+  if (!g_sd_ok) { show_msg("SNIFFER", "No SD card.\nNeed /sites/sniff/."); return; }
+  uhid_stop();
+  if (!usb_net_start()) { show_msg("USB-NET FAIL", usb_net_last_err()); return; }
+  if (!ls_http_start()) { show_msg("SNIFFER", "Server start failed."); return; }
+  if (!sniffer_start()) { show_msg("SNIFFER", "Promiscuous start\nfailed."); return; }
+  g_view = VIEW_SNIFF;
 }
 
 // ---------- Menu tree ----------
@@ -579,7 +601,7 @@ static Menu storage_menu = { "STORAGE", storage_items, 3, 0, 0 };
 static MenuItem wifi_items[] = {
   { "Scan",      KIND_ACTION, 0, act_wifi_scan, 0, 0 },
   { "Hotspot",   KIND_ACTION, 0, act_hotspot,   0, 0 },
-  { "Captive",   KIND_ACTION, 0, act_captive,   0, 0 },
+  { "Evil-Twin", KIND_ACTION, 0, act_eviltwin,  0, 0 },
   { "Free Heap", KIND_ACTION, 0, act_wifi_heap, 0, 0 },
 };
 static Menu wifi_menu = { "WIFI", wifi_items, 4, 0, 0 };
@@ -589,8 +611,9 @@ static Menu wifi_menu = { "WIFI", wifi_items, 4, 0, 0 };
 static MenuItem ls_items[] = {
   { "Wireless (WiFi)", KIND_ACTION, 0, act_ls_wireless, 0, 0 },
   { "Wired (USB-NCM)", KIND_ACTION, 0, act_ls_wired,    0, 0 },
+  { "Sniffer (NCM)",   KIND_ACTION, 0, act_ls_sniffer,  0, 0 },
 };
-static Menu localserve_menu = { "LOCALSERVE", ls_items, 2, 0, 0 };
+static Menu localserve_menu = { "LOCALSERVE", ls_items, 3, 0, 0 };
 
 static MenuItem root_items[] = {
   { "BLE",      KIND_SUBMENU, &ble_menu,     0, 0, 0 },
@@ -1011,6 +1034,7 @@ static void sync_localserve() {
       g_aps = (wifi_ap_t*)malloc(sizeof(wifi_ap_t) * WIFI_MAX_AP);
   }
   if (!now && was) {
+    sniffer_stop();
     ls_http_stop();
     usb_net_stop();
     if (g_aps) { free(g_aps); g_aps = 0; }
@@ -1414,7 +1438,7 @@ static void commit_wifi_text() {
     g_ap_pass[sizeof(g_ap_pass) - 1] = 0;
     do_hotspot_start();
   } else if (g_tin_mode == TIN_CAPNAME) {
-    if (!g_tin[0]) { show_msg("CAPTIVE", "Name cannot\nbe empty."); return; }
+    if (!g_tin[0]) { show_msg("EVIL-TWIN", "Name cannot\nbe empty."); return; }
     strncpy(g_cap_name, g_tin, sizeof(g_cap_name) - 1);
     g_cap_name[sizeof(g_cap_name) - 1] = 0;
     cap_open_picker();
@@ -1918,6 +1942,14 @@ static void tick_wifiscan() {
     case '/': case '\n': case '\r': {
       if (g_ap_count == 0) break;
       wifi_ap_t* a = &g_aps[g_ap_sel];
+      if (g_evil_mode) {
+        // Clone the picked SSID into the open AP name, then pick the page.
+        strncpy(g_cap_name, a->ssid, sizeof(g_cap_name) - 1);
+        g_cap_name[sizeof(g_cap_name) - 1] = 0;
+        g_evil_mode = false;
+        cap_open_picker();
+        break;
+      }
       strncpy(g_wifi_ssel, a->ssid, sizeof(g_wifi_ssel) - 1);
       g_wifi_ssel[sizeof(g_wifi_ssel) - 1] = 0;
       g_wifi_auth = a->authmode;
@@ -1926,6 +1958,7 @@ static void tick_wifiscan() {
       break;
     }
     case ',': case '`':
+      g_evil_mode = false;
       leave_screen();
       break;
     default: break;
@@ -2055,6 +2088,35 @@ static void tick_hotspot() {
   }
 }
 
+static void draw_sniff() {
+  canvas.fillSprite(C_BG);
+  draw_statusbar("Sniffer ON");
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  int y = LIST_Y;
+  char ip[20] = {0}; usb_net_ip(ip, sizeof(ip));
+  char l[80];
+  canvas.setTextColor(C_ACCENT, C_BG);
+  snprintf(l, sizeof(l), "ch %u   frames %u",
+           (unsigned)sniffer_channel(), (unsigned)sniffer_frames());
+  canvas.drawString(l, 10, y);
+  snprintf(l, sizeof(l), "devices  %u", (unsigned)sniffer_devices());
+  canvas.drawString(l, 10, y + 18);
+  canvas.setTextColor(C_TEXT, C_BG);
+  canvas.drawString("open on the PC:", 10, y + 42);
+  canvas.setTextColor(C_DIM, C_BG);
+  snprintf(l, sizeof(l), "http://%s/sniff/", ip);
+  canvas.drawString(l, 10, y + 58);
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString(", back (NCM stays up)", 8, H - 2);
+  canvas.pushSprite(LMARGIN, 0);
+}
+static void tick_sniff() {
+  char k = kb_poll();
+  if (k == ',' || k == '`') { g_view = VIEW_MENU; g_last = k; }
+}
+
 // ======================= CAPTIVE PORTAL =======================
 #define CAP_MAX      64
 #define CAP_HTML_MAX 24576
@@ -2076,10 +2138,10 @@ static void cap_cleanup_sd() {
 static void cap_open_picker() {
   g_cap_count = 0; g_cap_sel = 0; g_cap_top = 0;
   g_cap_sd = sd_mount();
-  if (!g_cap_sd) { show_msg("CAPTIVE", "No SD card.\nNeed /captive/*.html"); return; }
+  if (!g_cap_sd) { show_msg("EVIL-TWIN", "No SD card.\nNeed /captive/*.html"); return; }
   sd_make_dir("/captive");
   if (!g_cap) g_cap = (sd_entry_t*)malloc(sizeof(sd_entry_t) * CAP_MAX);
-  if (!g_cap) { cap_cleanup_sd(); show_msg("CAPTIVE", "Out of memory."); return; }
+  if (!g_cap) { cap_cleanup_sd(); show_msg("EVIL-TWIN", "Out of memory."); return; }
   bool t; int n = sd_list("/captive", g_cap, CAP_MAX, &t);
   int w = 0;
   for (int i = 0; i < n; i++)
@@ -2093,14 +2155,14 @@ static void cap_launch(int idx) {
   char path[128];
   snprintf(path, sizeof(path), "/captive/%s", g_cap[idx].name);
   if (!g_cap_html) g_cap_html = (char*)malloc(CAP_HTML_MAX);
-  if (!g_cap_html) { cap_cleanup_sd(); show_msg("CAPTIVE", "Out of memory."); return; }
+  if (!g_cap_html) { cap_cleanup_sd(); show_msg("EVIL-TWIN", "Out of memory."); return; }
   int r = sd_read_file(path, g_cap_html, CAP_HTML_MAX);
   cap_cleanup_sd();                 // page is in RAM now; release SD + list
-  if (r < 0) { free(g_cap_html); g_cap_html = 0; show_msg("CAPTIVE", "Read failed."); return; }
+  if (r < 0) { free(g_cap_html); g_cap_html = 0; show_msg("EVIL-TWIN", "Read failed."); return; }
   g_cap_html_len = r;
   if (!wifi_net_cp_start(g_cap_name, g_cap_html, g_cap_html_len)) {
     free(g_cap_html); g_cap_html = 0;
-    show_msg("CAPTIVE", "Failed to start\ncaptive portal.");
+    show_msg("EVIL-TWIN", "Failed to start\ncaptive portal.");
     return;
   }
   g_view = VIEW_CAPTIVE;
@@ -2114,7 +2176,7 @@ static void cap_stop() {
 
 static void draw_cappick() {
   canvas.fillSprite(C_BG);
-  draw_statusbar("Captive: page");
+  draw_statusbar("Evil-Twin: page");
   canvas.setFont(&fonts::Font2);
   if (g_cap_count == 0) {
     canvas.setTextColor(C_DIM, C_BG);
@@ -2152,7 +2214,7 @@ static void tick_cappick() {
 
 static void draw_captive() {
   canvas.fillSprite(C_BG);
-  draw_statusbar("Captive ON");
+  draw_statusbar("Evil-Twin ON");
   canvas.setFont(&fonts::Font2);
   canvas.setTextDatum(textdatum_t::top_left);
   int y = LIST_Y;
@@ -2280,6 +2342,7 @@ extern "C" void app_main(void) {
       case VIEW_HOTSPOT:  tick_hotspot();  if (g_view == VIEW_HOTSPOT)  draw_hotspot();  break;
       case VIEW_CAPPICK:  tick_cappick();  if (g_view == VIEW_CAPPICK)  draw_cappick();  break;
       case VIEW_CAPTIVE:  tick_captive();  if (g_view == VIEW_CAPTIVE)  draw_captive();  break;
+      case VIEW_SNIFF:    tick_sniff();    if (g_view == VIEW_SNIFF)    draw_sniff();    break;
       default: break;
     }
     vTaskDelay(pdMS_TO_TICKS(16));
