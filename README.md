@@ -27,6 +27,7 @@ lwIP** for networking.
 | **Ducky**     | Runs DuckyScript payloads from the SD card over either BLE or USB. |
 | **Storage**   | Browse / create / rename / delete files and folders on a microSD card. |
 | **Wi-Fi**     | Scan networks, join one and verify real internet, run a hotspot, or host a captive portal. Plus a live signal meter and NTP clock sync. |
+| **LocalServe** | Host static sites straight off the SD card over the LAN - the Cardputer becomes a tiny web host. |
 
 Everything is **lazy and mutually exclusive**: a radio or the SD card is powered
 up only while you are inside its menu and fully torn down the moment you leave.
@@ -118,6 +119,26 @@ mutually exclusive with BLE/USB by design.
   serves your page to anyone who joins - so phones auto-pop the "sign in to
   network" page. Live clients + page-hit counters.
 
+### LocalServe (work in progress)
+
+`LocalServe` serves static sites straight off the SD card over your LAN, turning
+the Cardputer into a small self-hosted web host.
+
+- **Wireless (Wi-Fi)** - join a network (reusing the Wi-Fi scan/connect flow),
+  then Nexus starts an HTTP server and serves files from `/sites` on the SD
+  card, showing the `http://<ip>/` to open. Content type is set by extension,
+  large files stream in chunks, a pre-compressed `.gz` twin is preferred when
+  present, and `PUT`/`POST /api/save/<path>` writes a file (temp + rename). If
+  `/sites` has no `index.html`, a built-in launcher page is shown.
+- **Wired (RNDIS)** - the same server over a USB network link - coming in a
+  later update.
+
+> Status: on-device web serving is still being verified; the menu, server and
+> SD plumbing are in place.
+
+A **Temp Debug** item under `Settings` reports the raw temperature-sensor
+install / enable / read return codes - handy when bringing up new hardware.
+
 ---
 
 ## Hardware
@@ -157,6 +178,7 @@ flowchart TD
     UI --> WIFI["wifi_net (esp_wifi / lwIP)"]
     WIFI --> AP["SoftAP + HTTP server + DNS (captive portal)"]
     WIFI --> STA["STA scan / connect / internet probe / NTP"]
+    UI --> LS["localserve (HTTP server, serves /sites off SD)"]
     DUCK["Ducky engine"] --> HID
     DUCK --> SD
 ```
@@ -175,6 +197,7 @@ Nexus/
     sd_store.cpp/.h     microSD mount + file ops (SPI2)
     wifi_net.cpp/.h     Wi-Fi: scan, connect, internet probe, hotspot,
                         captive portal (HTTP + DNS), NTP
+    localserve.cpp/.h   SD-hosted static web server (/sites over the LAN)
 ```
 
 ---

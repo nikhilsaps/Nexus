@@ -18,6 +18,7 @@
 #include "usb_hid.h"
 #include "sd_store.h"
 #include "wifi_net.h"
+#include "localserve.h"
 
 // ---------- Palette (cyberdeck terminal) ----------
 static M5GFX display;
@@ -204,15 +205,32 @@ static int  g_temp_c   = 0;       // last die temperature, Celsius
 static bool g_temp_on  = true;    // show temp in the status bar
 static int  g_temp_sec = 5;       // sample interval, seconds
 static temperature_sensor_handle_t g_tsens = NULL;
+// --- diagnostics (shown on Settings > Temp Debug) ---
+static esp_err_t g_t_ie = ESP_FAIL;   // install result
+static esp_err_t g_t_ee = ESP_FAIL;   // enable result
+static esp_err_t g_t_re = ESP_FAIL;   // last read result
+static float     g_t_raw = -999.0f;   // last raw celsius
+static int       g_t_n   = 0;         // read count
 static void temp_init() {
-  temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 110);
-  if (temperature_sensor_install(&cfg, &g_tsens) == ESP_OK)
-    temperature_sensor_enable(g_tsens);
+  // Range MUST match one of the S3 sensor windows (periph table): 50..125,
+  // 20..100, -10..80, -30..50, -40..20. The driver needs a single window that
+  // fully contains [min,max] or install returns ESP_ERR_INVALID_ARG. The die is
+  // always >20C once powered; 100 top leaves headroom for load. (The old
+  // -10..110 fit no window -> that was the 0C bug.)
+  temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
+  g_t_ie = temperature_sensor_install(&cfg, &g_tsens);
+  g_t_ee = (g_t_ie == ESP_OK) ? temperature_sensor_enable(g_tsens) : g_t_ie;
+  if (g_t_ie != ESP_OK || g_t_ee != ESP_OK) g_tsens = NULL;
+  ESP_LOGW("temp", "install=%s enable=%s", esp_err_to_name(g_t_ie), esp_err_to_name(g_t_ee));
 }
 static void temp_sample() {
   if (!g_tsens) return;
-  float t = 0;
-  if (temperature_sensor_get_celsius(g_tsens, &t) == ESP_OK) g_temp_c = (int)(t + 0.5f);
+  float t = -999.0f;
+  g_t_re = temperature_sensor_get_celsius(g_tsens, &t);
+  g_t_raw = t;
+  g_t_n++;
+  if (g_t_re == ESP_OK) g_temp_c = (int)(t + 0.5f);
+  ESP_LOGW("temp", "read=%s raw=%.2f n=%d", esp_err_to_name(g_t_re), t, g_t_n);
 }
 
 static Menu* g_stack[8];
@@ -289,6 +307,7 @@ static char        g_ap_ssid[WIFI_SSID_MAX];
 static char        g_ap_pass[64];
 static bool        g_wifi_connected = false;
 static int         g_wifi_inet = -1;   // -1 unknown, 0 no, 1 yes
+static bool        g_serve_mode = false;  // true = this WiFi session is a LocalServe host
 static char        g_cap_name[WIFI_SSID_MAX];
 static char*       g_cap_html = 0;
 static int         g_cap_html_len = 0;
@@ -416,6 +435,14 @@ static void act_info() {
   g_view      = VIEW_MSG;
 }
 static void act_about()   { show_msg("ABOUT", "NEXUS\nBLE + USB HID\nCardputer ESP32-S3\nnexus // cyberdeck"); }
+static char g_tdbg[160];
+static void act_temp_debug() {
+  snprintf(g_tdbg, sizeof(g_tdbg),
+           "install: %s\nenable: %s\nread: %s\nraw: %.2f C\nreads: %d\nshown: %d C",
+           esp_err_to_name(g_t_ie), esp_err_to_name(g_t_ee),
+           esp_err_to_name(g_t_re), (double)g_t_raw, g_t_n, g_temp_c);
+  show_msg("TEMP DEBUG", g_tdbg);
+}
 
 // ---------- Storage actions ----------
 static void act_browse() {
@@ -449,6 +476,7 @@ static void act_wifi_scan() {
     show_msg("WIFI", "WiFi not ready.\nLeave and re-enter\nthe WiFi menu.");
     return;
   }
+  g_serve_mode = false;   // plain scan, not a LocalServe session
   g_view = VIEW_WIFISCAN;
   wifi_scan_now();
 }
@@ -466,6 +494,22 @@ static void act_hotspot() {
 static void act_captive() {
   if (!wifi_net_running()) { show_msg("CAPTIVE", "WiFi not ready."); return; }
   begin_text(TIN_CAPNAME, "Nexus");
+}
+
+// ---------- LocalServe actions ----------
+// Wireless: reuse the WiFi scan/connect flow, then start the file server on the
+// STA netif (handled in do_wifi_connect when g_serve_mode is set).
+static void act_ls_wireless() {
+  if (!wifi_net_running() || !g_aps) {
+    show_msg("LOCALSERVE", "WiFi not ready.\nLeave and re-enter\nLocalServe.");
+    return;
+  }
+  g_serve_mode = true;
+  g_view = VIEW_WIFISCAN;
+  wifi_scan_now();
+}
+static void act_ls_wired() {
+  show_msg("LOCALSERVE", "Wired (RNDIS) lands\nin the next update.\nUse Wireless for now.");
 }
 
 // ---------- Menu tree ----------
@@ -489,9 +533,10 @@ static MenuItem set_items[] = {
   { "Animation", KIND_TOGGLE, 0, 0, &g_anim_on, on_anim_toggle },
   { "Temp Bar",  KIND_TOGGLE, 0, 0, &g_temp_on, on_temp_toggle },
   { "Temp Rate", KIND_CYCLE,  0, act_temp_rate, 0, 0, &g_temp_sec },
+  { "Temp Debug",KIND_ACTION, 0, act_temp_debug, 0, 0 },
   { "About",     KIND_ACTION, 0, act_about, 0, 0 },
 };
-static Menu set_menu = { "SETTINGS", set_items, 5, 0, 0 };
+static Menu set_menu = { "SETTINGS", set_items, 6, 0, 0 };
 
 // USB mirrors BLE: USB > Control > Keyboard / Mouse / Gamepad (native USB HID).
 static MenuItem usb_control_items[] = {
@@ -524,14 +569,23 @@ static MenuItem wifi_items[] = {
 };
 static Menu wifi_menu = { "WIFI", wifi_items, 4, 0, 0 };
 
+// LocalServe: host a static multi-site tree off the microSD over the network.
+// Wireless = join WiFi (STA) and serve on the LAN; Wired = USB-RNDIS (next build).
+static MenuItem ls_items[] = {
+  { "Wireless (WiFi)", KIND_ACTION, 0, act_ls_wireless, 0, 0 },
+  { "Wired (RNDIS)",   KIND_ACTION, 0, act_ls_wired,    0, 0 },
+};
+static Menu localserve_menu = { "LOCALSERVE", ls_items, 2, 0, 0 };
+
 static MenuItem root_items[] = {
   { "BLE",      KIND_SUBMENU, &ble_menu,     0, 0, 0 },
   { "USB",      KIND_SUBMENU, &usb_menu,     0, 0, 0 },
   { "Storage",  KIND_SUBMENU, &storage_menu, 0, 0, 0 },
-  { "WiFi",     KIND_SUBMENU, &wifi_menu,    0, 0, 0 },
-  { "Settings", KIND_SUBMENU, &set_menu,     0, 0, 0 },
+  { "WiFi",       KIND_SUBMENU, &wifi_menu,       0, 0, 0 },
+  { "LocalServe", KIND_SUBMENU, &localserve_menu, 0, 0, 0 },
+  { "Settings",   KIND_SUBMENU, &set_menu,        0, 0, 0 },
 };
-static Menu root_menu = { "NEXUS", root_items, 5, 0, 0 };
+static Menu root_menu = { "NEXUS", root_items, 6, 0, 0 };
 
 // ---------- Layout ----------
 static const int W = 240, H = 135;
@@ -930,6 +984,28 @@ static void sync_wifi() {
   was = now;
 }
 
+// LocalServe mirrors the WiFi+Storage pattern: entering the subtree brings up
+// WiFi (STA) and the SD card; leaving stops the file server, WiFi and SD.
+static void sync_localserve() {
+  static bool was = false;
+  bool now = stack_has(&localserve_menu);
+  if (now && !was) {
+    g_sd_ok = sd_mount();
+    if (wifi_net_start() && !g_aps)
+      g_aps = (wifi_ap_t*)malloc(sizeof(wifi_ap_t) * WIFI_MAX_AP);
+  }
+  if (!now && was) {
+    ls_http_stop();
+    if (g_aps) { free(g_aps); g_aps = 0; }
+    wifi_net_stop();
+    g_ap_count = 0;
+    sd_unmount();
+    g_sd_ok = false;
+    g_serve_mode = false;
+  }
+  was = now;
+}
+
 static void enter_item(Menu* m) {
   MenuItem* it = &m->items[m->sel];
   switch (it->kind) {
@@ -1279,6 +1355,17 @@ static void do_wifi_connect(const char* ssid, const char* pass) {
     canvas.drawString("Checking internet...", W / 2, H / 2);
     canvas.pushSprite(0, 0);
     g_wifi_inet = wifi_net_check_internet();
+  }
+  if (g_wifi_connected && g_serve_mode) {
+    char ip[20] = "?", gw[20];
+    wifi_net_sta_ipinfo(ip, gw, sizeof(ip));
+    bool up = ls_http_start();
+    snprintf(g_wifi_stat, sizeof(g_wifi_stat),
+      up ? "Serving /sites at\nhttp://%s/\n\nOpen on any device\non this network."
+         : "Server start FAILED.\nCard not mounted?\n(%s)", ip);
+    g_serve_mode = false;
+    show_msg("LOCALSERVE", g_wifi_stat);
+    return;
   }
   g_view = VIEW_WIFISTAT;
 }
@@ -2150,6 +2237,7 @@ extern "C" void app_main(void) {
           sync_radios();
           sync_storage();
           sync_wifi();
+          sync_localserve();
         }
         if (dirty && g_view == VIEW_MENU) draw_menu(cur(), (float)cur()->sel);
         break;

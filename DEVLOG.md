@@ -1,7 +1,7 @@
 # Nexus - Development Log
 
 A running record of what is built and how, so work can resume cleanly.
-Last updated: 2026-10-12.
+Last updated: 2026-10-13.
 
 ## Status: all core features complete and verified on hardware
 
@@ -14,10 +14,11 @@ Last updated: 2026-10-12.
 | Wi-Fi: Scan | done, verified |
 | Wi-Fi: Connect + internet (HTTP-204) test | done, verified |
 | Wi-Fi: live RSSI signal meter | done (on the connect status screen) |
-| Die-temperature readout in status bar | done (toggle + 2/5/10/30/60s rate, NVS-saved) |
+| Die-temperature readout in status bar | done, verified 33C (toggle + 2/5/10/30/60s rate, NVS-saved) |
 | Wi-Fi: NTP clock sync | done |
 | Wi-Fi: Hotspot (SoftAP) | done |
 | Wi-Fi: Captive portal (DNS + HTTP, page from `/captive`) | done |
+| LocalServe (SD-hosted static sites over LAN) | in progress (menu + server built; on-device serving not yet verified) |
 
 ## Design principles (do not break these)
 
@@ -46,6 +47,11 @@ Last updated: 2026-10-12.
   internet probe (HTTP 204 to detect real internet / captive portals), RSSI,
   SoftAP, captive portal (wildcard HTTP server + a UDP:53 DNS catch-all task
   answering every query with 192.168.4.1), and SNTP time sync.
+- `localserve.cpp` - esp_http_server that serves static files from `/sites` on
+  the SD card: content type by extension, chunked fopen streaming for big files,
+  `.gz`-twin preference, a built-in launcher when `/sites` has no `index.html`,
+  and `PUT`/`POST /api/save/<path>` (temp file + rename). Reuses the Wi-Fi
+  scan/connect flow to get on the LAN; mutually exclusive like the other radios.
 
 ## Menu tree
 
@@ -55,14 +61,17 @@ NEXUS (root)
   USB       -> Control (Keyboard/Mouse/Gamepad), Duck
   Storage   -> Browse, Card Info, Refresh
   WiFi      -> Scan, Hotspot, Captive, Free Heap
+  LocalServe-> Wireless (WiFi), Wired (RNDIS, next update)
   Settings  -> Logging, Animation, Temp Bar (on/off),
-               Temp Rate (2/5/10/30/60 s), About
+               Temp Rate (2/5/10/30/60 s), Temp Debug, About
 ```
 
 ## SD card layout (user-provided)
 
 - `/duck/*.txt`     - DuckyScript payloads.
 - `/captive/*.html` - captive-portal pages (folder auto-created on first use).
+- `/sites/`         - static site(s) LocalServe hosts over the LAN (put an
+                      `index.html` here; subfolders and assets are served too).
 
 ## AppView states
 
