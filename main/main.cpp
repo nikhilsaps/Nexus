@@ -19,6 +19,7 @@
 #include "sd_store.h"
 #include "wifi_net.h"
 #include "localserve.h"
+#include "usb_net.h"
 
 // ---------- Palette (cyberdeck terminal) ----------
 static M5GFX display;
@@ -509,7 +510,21 @@ static void act_ls_wireless() {
   wifi_scan_now();
 }
 static void act_ls_wired() {
-  show_msg("LOCALSERVE", "Wired (RNDIS) lands\nin the next update.\nUse Wireless for now.");
+  if (!g_sd_ok) {
+    show_msg("LOCALSERVE", "No SD card.\nNeed /sdcard/sites.");
+    return;
+  }
+  uhid_stop();                 // Wired needs the USB-OTG PHY that USB-HID holds.
+  if (!usb_net_start()) {
+    show_msg("USB-NET FAIL", usb_net_last_err());
+    return;
+  }
+  bool up = ls_http_start();
+  char ip[20]; usb_net_ip(ip, sizeof(ip));
+  snprintf(g_wifi_stat, sizeof(g_wifi_stat),
+    up ? "Serving /sites at\nhttp://%s/\n\nPlug USB into a PC;\na wired adapter\nappears."
+       : "Server start FAILED.\nCard not mounted?\n(%s)", ip);
+  show_msg("LOCALSERVE", g_wifi_stat);
 }
 
 // ---------- Menu tree ----------
@@ -573,7 +588,7 @@ static Menu wifi_menu = { "WIFI", wifi_items, 4, 0, 0 };
 // Wireless = join WiFi (STA) and serve on the LAN; Wired = USB-RNDIS (next build).
 static MenuItem ls_items[] = {
   { "Wireless (WiFi)", KIND_ACTION, 0, act_ls_wireless, 0, 0 },
-  { "Wired (RNDIS)",   KIND_ACTION, 0, act_ls_wired,    0, 0 },
+  { "Wired (USB-NCM)", KIND_ACTION, 0, act_ls_wired,    0, 0 },
 };
 static Menu localserve_menu = { "LOCALSERVE", ls_items, 2, 0, 0 };
 
@@ -588,7 +603,8 @@ static MenuItem root_items[] = {
 static Menu root_menu = { "NEXUS", root_items, 6, 0, 0 };
 
 // ---------- Layout ----------
-static const int W = 240, H = 135;
+static const int LMARGIN = 12;                // shift past a damaged left column
+static const int W = 240 - LMARGIN, H = 135;  // usable width; sprite pushed at +LMARGIN
 static const int BAR_H = 16;
 static const int ROW_H = 22;
 static const int LIST_Y = BAR_H + 4;
@@ -736,7 +752,7 @@ static void draw_menu(Menu* m, float accent_y) {
     canvas.setTextDatum(textdatum_t::bottom_right);
     canvas.drawString("PIN " NEXUS_PIN, W - 6, H - 2);
   }
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 static void draw_msg() {
@@ -761,7 +777,7 @@ static void draw_msg() {
   canvas.setTextColor(C_DIM, C_BG);
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.drawString(", back", 10, H - 4);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 // connection status chip (shared by HID screens)
@@ -801,7 +817,7 @@ static void draw_kb_screen() {
   canvas.setTextColor(C_DIM, C_BG);
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.drawString("` exit", 10, H - 4);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 static void mouse_pill(int x, int y, const char* s, bool on) {
@@ -848,7 +864,7 @@ static void draw_mouse_screen() {
   canvas.setTextColor(C_DIM, C_BG);
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.drawString("` exit", 10, H - 4);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 static void draw_pad_screen() {
@@ -879,7 +895,7 @@ static void draw_pad_screen() {
   canvas.setTextColor(C_DIM, C_BG);
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.drawString("` exit  ;./,/ dpad  asdf/qw btns", 10, H - 4);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 // ---------- Boot splash ----------
@@ -895,7 +911,7 @@ static void boot_splash() {
     canvas.drawString(word, W / 2, H / 2);
     if (step < W) canvas.fillRect(step, 0, W - step, H, C_BG);
     if (step < W) canvas.drawFastVLine(step, 0, H, C_ACCENT);
-    canvas.pushSprite(0, 0);
+    canvas.pushSprite(LMARGIN, 0);
     vTaskDelay(pdMS_TO_TICKS(16));
   }
   canvas.fillSprite(C_BG);
@@ -906,7 +922,7 @@ static void boot_splash() {
   canvas.setTextColor(C_DIM, C_BG);
   canvas.setTextDatum(textdatum_t::middle_center);
   canvas.drawString("cyberdeck // stage 2", W / 2, H / 2 + 30);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
   vTaskDelay(pdMS_TO_TICKS(600));
 }
 
@@ -996,6 +1012,7 @@ static void sync_localserve() {
   }
   if (!now && was) {
     ls_http_stop();
+    usb_net_stop();
     if (g_aps) { free(g_aps); g_aps = 0; }
     wifi_net_stop();
     g_ap_count = 0;
@@ -1216,7 +1233,7 @@ static void draw_files() {
   snprintf(ft, sizeof(ft), "%d%s  tab act  , up",
            g_entry_count, g_entries_trunc ? "+" : "");
   canvas.drawString(ft, 8, H - 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 // Append `name` to g_path (descend into a folder).
@@ -1344,7 +1361,7 @@ static void do_wifi_connect(const char* ssid, const char* pass) {
   canvas.setTextColor(C_ACCENT, C_BG);
   canvas.drawString("Connecting to", W / 2, H / 2 - 12);
   canvas.drawString(ssid, W / 2, H / 2 + 8);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
   g_wifi_connected = (wifi_net_connect(ssid, pass, 12000) == 1);
   g_wifi_inet = -1;
   if (g_wifi_connected) {
@@ -1353,7 +1370,7 @@ static void do_wifi_connect(const char* ssid, const char* pass) {
     canvas.setTextDatum(textdatum_t::middle_center);
     canvas.setTextColor(C_ACCENT, C_BG);
     canvas.drawString("Checking internet...", W / 2, H / 2);
-    canvas.pushSprite(0, 0);
+    canvas.pushSprite(LMARGIN, 0);
     g_wifi_inet = wifi_net_check_internet();
   }
   if (g_wifi_connected && g_serve_mode) {
@@ -1377,7 +1394,7 @@ static void do_hotspot_start() {
   canvas.setTextDatum(textdatum_t::middle_center);
   canvas.setTextColor(C_ACCENT, C_BG);
   canvas.drawString("Starting AP...", W / 2, H / 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
   if (!wifi_net_ap_start(g_ap_ssid, g_ap_pass)) { show_msg("HOTSPOT", "Failed to start AP."); return; }
   g_view = VIEW_HOTSPOT;
 }
@@ -1443,7 +1460,7 @@ static void draw_fileact() {
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.setTextColor(C_DIM, C_BG);
   canvas.drawString("ret ok   , back", 8, H - 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 static void tick_fileact() {
@@ -1482,7 +1499,7 @@ static void draw_textin() {
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.setTextColor(C_DIM, C_BG);
   canvas.drawString("ret save   ` cancel", 8, H - 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 static void tick_textin() {
@@ -1525,7 +1542,7 @@ static void draw_confirm() {
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.setTextColor(C_DIM, C_BG);
   canvas.drawString("ret delete   , cancel", 8, H - 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 static void tick_confirm() {
@@ -1764,7 +1781,7 @@ static void draw_duck() {
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.setTextColor(C_DIM, C_BG);
   canvas.drawString(", back", 8, H - 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 static void tick_duck() {
   char k = kb_poll();
@@ -1796,7 +1813,7 @@ static void draw_duckrun() {
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.setTextColor(C_DIM, C_BG);
   canvas.drawString("` abort during run   , back", 8, H - 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 static void tick_duckrun() {
   char k = kb_poll();
@@ -1829,7 +1846,7 @@ static void wifi_scan_now() {
   canvas.setTextDatum(textdatum_t::middle_center);
   canvas.setTextColor(C_ACCENT, C_BG);
   canvas.drawString("Scanning...", W / 2, H / 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
   g_ap_count = wifi_net_scan(g_aps, WIFI_MAX_AP);
   g_ap_sel = 0; g_ap_top = 0;
 }
@@ -1844,7 +1861,7 @@ static void draw_wifiscan() {
     canvas.setTextDatum(textdatum_t::middle_center);
     canvas.setTextColor(C_DIM, C_BG);
     canvas.drawString("no networks - r to scan", W / 2, H / 2);
-    canvas.pushSprite(0, 0);
+    canvas.pushSprite(LMARGIN, 0);
     return;
   }
   for (int i = 0; i < VIS && g_ap_top + i < g_ap_count; i++) {
@@ -1868,7 +1885,7 @@ static void draw_wifiscan() {
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.setTextColor(C_DIM, C_BG);
   canvas.drawString("ret join  i info  r scan", 8, H - 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 static void tick_wifiscan() {
@@ -1930,7 +1947,7 @@ static void draw_wifistat() {
     canvas.drawString("wrong password?", 10, y + 42);
     canvas.setTextDatum(textdatum_t::bottom_left);
     canvas.drawString(", back", 8, H - 2);
-    canvas.pushSprite(0, 0);
+    canvas.pushSprite(LMARGIN, 0);
     return;
   }
   char ip[16] = {0}, gw[16] = {0};
@@ -1958,7 +1975,7 @@ static void draw_wifistat() {
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.setTextColor(C_DIM, C_BG);
   canvas.drawString("r test  t time  d disc  , back", 8, H - 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 static void tick_wifistat() {
@@ -1972,7 +1989,7 @@ static void tick_wifistat() {
       canvas.setTextDatum(textdatum_t::middle_center);
       canvas.setTextColor(C_ACCENT, C_BG);
       canvas.drawString("Checking internet...", W / 2, H / 2);
-      canvas.pushSprite(0, 0);
+      canvas.pushSprite(LMARGIN, 0);
       g_wifi_inet = g_wifi_connected ? wifi_net_check_internet() : -1;
       break;
     }
@@ -1984,7 +2001,7 @@ static void tick_wifistat() {
       canvas.setTextDatum(textdatum_t::middle_center);
       canvas.setTextColor(C_ACCENT, C_BG);
       canvas.drawString("Syncing time...", W / 2, H / 2);
-      canvas.pushSprite(0, 0);
+      canvas.pushSprite(LMARGIN, 0);
       if (wifi_net_sntp_sync(g_wifi_stat, sizeof(g_wifi_stat)))
         show_msg("NTP TIME", g_wifi_stat);
       else
@@ -2025,7 +2042,7 @@ static void draw_hotspot() {
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.setTextColor(C_DIM, C_BG);
   canvas.drawString("d stop   , back", 8, H - 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 static void tick_hotspot() {
@@ -2118,7 +2135,7 @@ static void draw_cappick() {
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.setTextColor(C_DIM, C_BG);
   canvas.drawString("ret start   , back", 8, H - 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 static void tick_cappick() {
@@ -2150,7 +2167,7 @@ static void draw_captive() {
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.setTextColor(C_DIM, C_BG);
   canvas.drawString("d stop   , back", 8, H - 2);
-  canvas.pushSprite(0, 0);
+  canvas.pushSprite(LMARGIN, 0);
 }
 
 static void tick_captive() {
@@ -2174,6 +2191,7 @@ extern "C" void app_main(void) {
   display.begin();
   display.setRotation(1);
   display.setBrightness(160);
+  display.fillScreen(0);  // black out the physical strip left of the sprite (x<LMARGIN)
   init_palette();
   canvas.setColorDepth(16);
   canvas.createSprite(W, H);   // grab the big contiguous block before BLE

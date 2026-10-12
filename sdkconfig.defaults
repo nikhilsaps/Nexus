@@ -15,6 +15,8 @@ CONFIG_BT_NIMBLE_HID_SERVICE=y
 CONFIG_BT_NIMBLE_SVC_HID_MAX_INSTANCES=1
 # Native USB HID via TinyUSB (lazy: installed only inside USB > Control)
 CONFIG_TINYUSB_HID_COUNT=1
+# LocalServe Wired: USB-CDC-NCM network adapter (built-in Win11/macOS/Linux driver)
+CONFIG_TINYUSB_NET_MODE_NCM=y
 # FATFS long filenames for the microSD browser (Storage)
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255

@@ -27,7 +27,7 @@ lwIP** for networking.
 | **Ducky**     | Runs DuckyScript payloads from the SD card over either BLE or USB. |
 | **Storage**   | Browse / create / rename / delete files and folders on a microSD card. |
 | **Wi-Fi**     | Scan networks, join one and verify real internet, run a hotspot, or host a captive portal. Plus a live signal meter and NTP clock sync. |
-| **LocalServe** | Host static sites straight off the SD card over the LAN - the Cardputer becomes a tiny web host. |
+| **LocalServe** | Host static sites straight off the SD card - over Wi-Fi or a plain USB-C cable (USB-NCM). The Cardputer becomes a tiny web host. |
 
 Everything is **lazy and mutually exclusive**: a radio or the SD card is powered
 up only while you are inside its menu and fully torn down the moment you leave.
@@ -119,10 +119,11 @@ mutually exclusive with BLE/USB by design.
   serves your page to anyone who joins - so phones auto-pop the "sign in to
   network" page. Live clients + page-hit counters.
 
-### LocalServe (work in progress)
+### LocalServe
 
 `LocalServe` serves static sites straight off the SD card over your LAN, turning
-the Cardputer into a small self-hosted web host.
+the Cardputer into a small self-hosted web host, over Wi-Fi *or* a plain USB
+cable.
 
 - **Wireless (Wi-Fi)** - join a network (reusing the Wi-Fi scan/connect flow),
   then Nexus starts an HTTP server and serves files from `/sites` on the SD
@@ -130,11 +131,12 @@ the Cardputer into a small self-hosted web host.
   large files stream in chunks, a pre-compressed `.gz` twin is preferred when
   present, and `PUT`/`POST /api/save/<path>` writes a file (temp + rename). If
   `/sites` has no `index.html`, a built-in launcher page is shown.
-- **Wired (RNDIS)** - the same server over a USB network link - coming in a
-  later update.
-
-> Status: on-device web serving is still being verified; the menu, server and
-> SD plumbing are in place.
+- **Wired (USB-NCM)** - the same server over a USB-C network link, no Wi-Fi or
+  router needed. Nexus brings up a **USB-CDC-NCM** adapter (Windows 11 and Linux
+  have built-in drivers; no install), runs a DHCP server on a private
+  `192.168.7.1/24` link, and serves `/sites` at `http://192.168.7.1/`. Like USB
+  HID it claims the shared USB-OTG port, so the serial console drops while it is
+  active; restart to return to flashable serial mode.
 
 A **Temp Debug** item under `Settings` reports the raw temperature-sensor
 install / enable / read return codes - handy when bringing up new hardware.
@@ -179,6 +181,8 @@ flowchart TD
     WIFI --> AP["SoftAP + HTTP server + DNS (captive portal)"]
     WIFI --> STA["STA scan / connect / internet probe / NTP"]
     UI --> LS["localserve (HTTP server, serves /sites off SD)"]
+    LS --> LSW["Wi-Fi link (reuses wifi_net STA)"]
+    LS --> LSU["usb_net (USB-CDC-NCM + DHCP, 192.168.7.1)"]
     DUCK["Ducky engine"] --> HID
     DUCK --> SD
 ```
@@ -198,6 +202,7 @@ Nexus/
     wifi_net.cpp/.h     Wi-Fi: scan, connect, internet probe, hotspot,
                         captive portal (HTTP + DNS), NTP
     localserve.cpp/.h   SD-hosted static web server (/sites over the LAN)
+    usb_net.cpp/.h      USB-CDC-NCM adapter + esp_netif gateway + DHCP (Wired)
 ```
 
 ---
