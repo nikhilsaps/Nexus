@@ -16,7 +16,6 @@
 extern "C" void ble_store_config_init(void);
 extern "C" uint16_t g_nexus_conn;   // set in esp_hid_gap.c on connect
 
-static const char* TAG = "bhid";
 static esp_hidd_dev_t* s_dev = NULL;
 static volatile bool s_connected = false;
 static bool s_up   = false;   // NimBLE stack brought up once

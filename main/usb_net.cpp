@@ -1,6 +1,6 @@
 // usb_net.cpp - USB-CDC-NCM network adapter + gateway for LocalServe Wired.
-// esp_tinyusb builds the NCM USB device from its default descriptors (we pass a
-// zeroed tinyusb_config_t). We own an esp_netif at 192.168.7.1/24 with a DHCP
+// Explicit NCM descriptors coexist with the compiled-in HID support.
+// We own an esp_netif at 192.168.7.1/24 with a DHCP
 // server, and shuttle L2 frames both ways: netif TX -> tinyusb_net_send_sync,
 // USB RX -> esp_netif_receive. HTTP (esp_http_server) binds 0.0.0.0 so it is
 // served on this interface automatically once the link is up.
@@ -14,6 +14,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_netif_defaults.h"
+#include "esp_event.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -76,8 +77,8 @@ const char* usb_net_last_err(void) { return s_err; }
 // lwip wants to transmit a frame out the USB interface.
 static esp_err_t netif_transmit(void* h, void* buffer, size_t len) {
     (void)h;
-    tinyusb_net_send_sync(buffer, len, NULL, pdMS_TO_TICKS(100));
-    return ESP_OK;
+    if (len > UINT16_MAX) return ESP_ERR_INVALID_SIZE;
+    return tinyusb_net_send_sync(buffer, (uint16_t)len, NULL, pdMS_TO_TICKS(100));
 }
 
 // lwip is done with a buffer we handed to esp_netif_receive().
@@ -102,7 +103,16 @@ static esp_err_t usb_recv_cb(void* buffer, uint16_t len, void* ctx) {
 bool usb_net_start(void) {
     if (s_up) return true;
     s_err[0] = 0;
-    esp_err_t ei = esp_netif_init();  // idempotent; WiFi path already did this
+    esp_err_t ei = esp_netif_init();
+    if (ei != ESP_OK && ei != ESP_ERR_INVALID_STATE) {
+        snprintf(s_err, sizeof(s_err), "netif_init %s", esp_err_to_name(ei));
+        return false;
+    }
+    ei = esp_event_loop_create_default();
+    if (ei != ESP_OK && ei != ESP_ERR_INVALID_STATE) {
+        snprintf(s_err, sizeof(s_err), "event_init %s", esp_err_to_name(ei));
+        return false;
+    }
 
     static esp_netif_ip_info_t ip;
     memset(&ip, 0, sizeof(ip));
@@ -157,6 +167,7 @@ bool usb_net_start(void) {
     if (ti != ESP_OK) {
         snprintf(s_err, sizeof(s_err), "tusb_install\n%s\n(mac=%d dh=%d)",
                  esp_err_to_name(ti), em, ed);
+        esp_netif_action_stop(s_netif, NULL, 0, NULL);
         esp_netif_destroy(s_netif); s_netif = NULL;
         return false;
     }
@@ -169,6 +180,7 @@ bool usb_net_start(void) {
     if (tn != ESP_OK) {
         snprintf(s_err, sizeof(s_err), "net_init\n%s", esp_err_to_name(tn));
         tinyusb_driver_uninstall();
+        esp_netif_action_stop(s_netif, NULL, 0, NULL);
         esp_netif_destroy(s_netif); s_netif = NULL;
         return false;
     }

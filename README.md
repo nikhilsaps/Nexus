@@ -31,8 +31,9 @@ lwIP** for networking.
 
 Everything is **lazy and mutually exclusive**: a radio or the SD card is powered
 up only while you are inside its menu and fully torn down the moment you leave.
-On the idle root menu, Nexus holds almost no dynamic RAM - essential on a board
-with 512 KB SRAM and no PSRAM.
+The display sprite stays allocated; radio and file-list buffers are acquired
+on demand, important on a board with 512 KB SRAM and no PSRAM. USB-only
+LocalServe does not initialize Wi-Fi.
 
 ---
 
@@ -57,6 +58,39 @@ label. The temperature readout is toggleable and its sample rate is selectable
 ---
 
 ## Feature detail
+
+### LocalServe save reliability
+
+Saves stream through an exclusive `.nexus-tmp` file, check buffered writes and
+close errors, then move the previous file to `.nexus-bak` before replacement.
+Failed replacement attempts restore the old file; if restoration also fails,
+the backup is retained. This is **not power-loss atomic** on FATFS.
+
+- Save bodies are limited to 4 MiB; larger requests receive HTTP 413.
+- A leftover temporary file or ambiguous backup produces HTTP 409 instead of
+  silently discarding data. Stop LocalServe and inspect those files on the SD
+  card before removing them. A lone backup can be restored on the next save.
+- Reserved sidecar names cannot be read or written through the HTTP API.
+- Gzip twins are sent only when the client accepts gzip; SD I/O failures are
+  distinguished from missing files, and interrupted reads close the response.
+- This remains an unauthenticated local-network server. Use a trusted network;
+  do not expose the save endpoint to the internet.
+
+### UI performance and diagnostics
+
+- Screens redraw on input, view changes, transport changes and scheduled status
+  updates instead of continuously transferring a full sprite. Menu animation
+  advances in the main loop rather than blocking keyboard polling.
+- The existing `pdMS_TO_TICKS(16)` input delay is preserved (its actual duration
+  depends on the FreeRTOS tick rate). Network status screens refresh at 1 Hz.
+- `Settings > Memory` takes an on-demand snapshot of free heap, largest free
+  block, heap low-water mark and main-task stack headroom. No background scan.
+- `Settings > Power Save` opts into 80-240 MHz dynamic frequency scaling;
+  default OFF preserves 240 MHz. Light sleep stays disabled for USB/input
+  compatibility. Power savings and optional-mode latency are not benchmarked.
+- Directory navigation rejects paths that exceed the buffer. Leaving Mouse
+  sends a button-release report. Temperature failures display `--C`.
+
 
 ### BLE / USB HID (Control)
 
@@ -226,6 +260,20 @@ Nexus/
 ```
 
 ---
+
+## Regression checks
+
+```sh
+python tests/test_ui_guards.py
+g++ -std=c++17 -Wall -Wextra -Werror tests/test_path_push.cpp -o test_path
+./test_path
+g++ -std=c++17 -Wall -Wextra -Werror -Imain tests/test_safe_replace.cpp -o test_save
+./test_save
+g++ -std=c++17 -Wall -Wextra -Werror tests/test_gzip.cpp -o test_gzip
+./test_gzip
+```
+
+These host checks do not replace on-device UI, HID, SD-card and network tests.
 
 ## License
 

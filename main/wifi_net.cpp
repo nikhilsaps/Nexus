@@ -58,6 +58,11 @@ bool wifi_net_start(void) {
   if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) return false;
   g_sta = esp_netif_create_default_wifi_sta();
   g_ap  = esp_netif_create_default_wifi_ap();
+  if (!g_sta || !g_ap) {
+    if (g_sta) { esp_netif_destroy_default_wifi(g_sta); g_sta = 0; }
+    if (g_ap)  { esp_netif_destroy_default_wifi(g_ap);  g_ap = 0; }
+    return false;
+  }
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   if (esp_wifi_init(&cfg) != ESP_OK) {
     if (g_sta) { esp_netif_destroy_default_wifi(g_sta); g_sta = 0; }
@@ -65,12 +70,17 @@ bool wifi_net_start(void) {
     return false;
   }
   g_eg = xEventGroupCreate();
-  esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                      on_evt, 0, &g_h_wifi);
-  esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                      on_evt, 0, &g_h_ip);
-  esp_wifi_set_storage(WIFI_STORAGE_RAM);
+  // Mark owned resources before registration so partial failures use one cleanup.
   g_running = true;
+  if (!g_eg ||
+      esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                          on_evt, 0, &g_h_wifi) != ESP_OK ||
+      esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                          on_evt, 0, &g_h_ip) != ESP_OK ||
+      esp_wifi_set_storage(WIFI_STORAGE_RAM) != ESP_OK) {
+    wifi_net_stop();
+    return false;
+  }
   g_mode    = WIFI_MODE_NULL;
   g_ap_mode = false;
   g_have_ip = false;
@@ -107,18 +117,24 @@ static void enter_sta(void) {
 }
 
 int wifi_net_scan(wifi_ap_t* out, int max) {
-  if (!g_running || max <= 0) return 0;
+  if (!g_running || !out || max <= 0) return 0;
   enter_sta();
   wifi_scan_config_t sc = {};
   sc.show_hidden = false;
   if (esp_wifi_scan_start(&sc, true) != ESP_OK) return 0;
   uint16_t n = 0;
-  esp_wifi_scan_get_ap_num(&n);
-  if (n == 0) return 0;
+  if (esp_wifi_scan_get_ap_num(&n) != ESP_OK || n == 0) {
+    esp_wifi_clear_ap_list();
+    return 0;
+  }
   wifi_ap_record_t* recs =
       (wifi_ap_record_t*)malloc(sizeof(wifi_ap_record_t) * n);
   if (!recs) { esp_wifi_clear_ap_list(); return 0; }
-  esp_wifi_scan_get_ap_records(&n, recs);
+  if (esp_wifi_scan_get_ap_records(&n, recs) != ESP_OK) {
+    free(recs);
+    esp_wifi_clear_ap_list();
+    return 0;
+  }
   int cnt = 0;
   for (int i = 0; i < (int)n && cnt < max; i++) {
     const char* s = (const char*)recs[i].ssid;

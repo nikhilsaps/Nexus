@@ -1,9 +1,9 @@
 # Nexus - Development Log
 
 A running record of what is built and how, so work can resume cleanly.
-Last updated: 2026-10-13.
+Last updated: 2026-10-15.
 
-## Status: all core features complete and verified on hardware
+## Status: core baseline verified; optimization regression checks in progress
 
 | Feature | State |
 |---------|-------|
@@ -166,3 +166,31 @@ esp_driver_sdspi, esp_wifi, esp_netif, lwip, esp_http_server.
   SD path are unchanged; only the user-facing strings and the clone step are new.
 - Verified on hardware: clones a chosen SSID and serves the page. Auto-join is
   limited by design (open-vs-WPA2 mismatch, no deauth) - expected, not a bug.
+
+## 2026-10-15 - UI and LocalServe reliability optimization
+
+- Dirty redraws across tool screens and non-blocking menu animation; existing
+  FreeRTOS input delay preserved. On-demand Settings > Memory diagnostics.
+- Opt-in persisted Power Save (80-240 MHz DFS), default OFF; no light sleep.
+- Wired LocalServe no longer starts WiFi. Wireless hosting skips the unrelated
+  internet probe. Partial WiFi startup/scan failures clean up resources.
+- Bounded folder navigation, mouse release on exit, text-entry invalidation,
+  storage allocation cleanup, temperature error display and quieter samples.
+- LocalServe checks write/flush/close errors; backup/restore replacement keeps
+  originals on failure. Existing backup sidecars are never blindly deleted.
+  Failed restores leave the original in .nexus-bak; this is NOT power-loss atomic.
+- Saves limited to 4 MiB; exclusive temp creation; FAT-safe path guards; gzip
+  negotiation, I/O error reporting and handler-registration cleanup.
+- A retained backup blocks later saves (409) when both copies exist. Resolve
+  deliberately on SD. URLs are still not percent-decoded. No authentication
+  added: use LocalServe on trusted networks only.
+- ESP-IDF 5.4.4 build passed, app 1,440,080 bytes (54% app partition free).
+- COM3 app-only flash passed with esptool hash verification. NVS/layout unchanged.
+- Host checks: 12 Python source guards; safe_replace suite 110 checks; independent
+  recovery tests, path boundary tests and eight gzip cases all passed. Native
+  C++ tests ran with AddressSanitizer/UndefinedBehaviorSanitizer on Linux g++.
+- Actual previous application read back before flash and compared against saved
+  binary; rollback retained in Aki workspace nexus-review/rollback and remote
+  build/pre-optimization-device-app.bin.
+- Interactive UI, HID, SD HTTP saves and optional DFS behavior not verified on
+  hardware in this pass. No measured battery/latency claims.

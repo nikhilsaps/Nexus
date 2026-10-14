@@ -9,6 +9,8 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <esp_pm.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,6 +88,7 @@ static int kb_scan_full(char* out, int maxn, bool* shift) {
 
 // Edge-detected single key for menu navigation.
 static char g_last = 0;
+static bool g_ui_dirty = false;
 static char kb_poll() {
   char buf[8];
   int n = kb_scan_full(buf, 8, NULL);
@@ -93,6 +96,7 @@ static char kb_poll() {
   char out = 0;
   if (c && c != g_last) out = c;
   g_last = c;
+  if (out) g_ui_dirty = true;
   return out;
 }
 
@@ -170,7 +174,7 @@ struct MenuItem {
   void      (*action)();
   bool*       flag;
   void      (*on_toggle)(bool);
-  int*        ival;
+  int*        ival = nullptr;
 };
 struct Menu {
   const char* title;
@@ -184,6 +188,9 @@ struct Menu {
 enum AppView { VIEW_MENU, VIEW_MSG, VIEW_KB, VIEW_MOUSE, VIEW_PAD, VIEW_FILES,
                 VIEW_FILEACT, VIEW_TEXTIN, VIEW_CONFIRM, VIEW_DUCK, VIEW_DUCKRUN, VIEW_WIFISCAN, VIEW_WIFISTAT, VIEW_HOTSPOT, VIEW_CAPPICK, VIEW_CAPTIVE, VIEW_SNIFF };
 static AppView g_view = VIEW_MENU;
+static Menu* g_anim_menu = NULL;
+static TickType_t g_anim_start = 0;
+static float g_anim_from = 0;
 
 // ---------- Transport (BLE vs USB) ----------
 // HID screens are shared; g_xport decides which stack a report goes to.
@@ -203,6 +210,15 @@ static void hid_pad(uint16_t b, int8_t x, int8_t y) {
 
 static bool g_log_on  = false;
 static bool g_anim_on = true;
+static bool g_power_save = false;
+static esp_err_t g_pm_result = ESP_OK;
+static void apply_power() {
+  esp_pm_config_t cfg = {};
+  cfg.max_freq_mhz = 240;
+  cfg.min_freq_mhz = g_power_save ? 80 : 240;
+  cfg.light_sleep_enable = false;  // preserve USB and keyboard wake behavior
+  g_pm_result = esp_pm_configure(&cfg);
+}
 static int  g_temp_c   = 0;       // last die temperature, Celsius
 static bool g_temp_on  = true;    // show temp in the status bar
 static int  g_temp_sec = 5;       // sample interval, seconds
@@ -222,6 +238,7 @@ static void temp_init() {
   temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
   g_t_ie = temperature_sensor_install(&cfg, &g_tsens);
   g_t_ee = (g_t_ie == ESP_OK) ? temperature_sensor_enable(g_tsens) : g_t_ie;
+  if (g_t_ie == ESP_OK && g_t_ee != ESP_OK) temperature_sensor_uninstall(g_tsens);
   if (g_t_ie != ESP_OK || g_t_ee != ESP_OK) g_tsens = NULL;
   ESP_LOGW("temp", "install=%s enable=%s", esp_err_to_name(g_t_ie), esp_err_to_name(g_t_ee));
 }
@@ -232,7 +249,7 @@ static void temp_sample() {
   g_t_raw = t;
   g_t_n++;
   if (g_t_re == ESP_OK) g_temp_c = (int)(t + 0.5f);
-  ESP_LOGW("temp", "read=%s raw=%.2f n=%d", esp_err_to_name(g_t_re), t, g_t_n);
+  ESP_LOGD("temp", "read=%s raw=%.2f n=%d", esp_err_to_name(g_t_re), t, g_t_n);
 }
 
 static Menu* g_stack[8];
@@ -372,10 +389,13 @@ static void nvs_load() {
     if (nvs_get_u8(h, "log", &v) == ESP_OK) g_log_on = v;
     v = 1;
     if (nvs_get_u8(h, "anim", &v) == ESP_OK) g_anim_on = v;
+    v = 0;
+    if (nvs_get_u8(h, "pmsave", &v) == ESP_OK) g_power_save = v;
     v = 1;
     if (nvs_get_u8(h, "tempon", &v) == ESP_OK) g_temp_on = v;
     uint8_t ts = 5;
-    if (nvs_get_u8(h, "tempsec", &ts) == ESP_OK) g_temp_sec = ts;
+    if (nvs_get_u8(h, "tempsec", &ts) == ESP_OK &&
+        (ts == 2 || ts == 5 || ts == 10 || ts == 30 || ts == 60)) g_temp_sec = ts;
     nvs_close(h);
   }
   apply_log();
@@ -385,6 +405,7 @@ static void nvs_save() {
   if (nvs_open("nexus", NVS_READWRITE, &h) == ESP_OK) {
     nvs_set_u8(h, "log", g_log_on ? 1 : 0);
     nvs_set_u8(h, "anim", g_anim_on ? 1 : 0);
+    nvs_set_u8(h, "pmsave", g_power_save ? 1 : 0);
     nvs_set_u8(h, "tempon", g_temp_on ? 1 : 0);
     nvs_set_u8(h, "tempsec", (uint8_t)g_temp_sec);
     nvs_commit(h);
@@ -393,6 +414,11 @@ static void nvs_save() {
 }
 static void on_log_toggle(bool v)  { apply_log(); nvs_save(); }
 static void on_anim_toggle(bool v) { nvs_save(); }
+static void on_power_toggle(bool v) {
+  apply_power();
+  if (g_pm_result != ESP_OK) g_power_save = false;
+  nvs_save();
+}
 static void on_temp_toggle(bool v) { nvs_save(); }
 static void act_temp_rate() {
   static const int steps[] = { 2, 5, 10, 30, 60 };
@@ -404,7 +430,7 @@ static void act_temp_rate() {
 }
 
 // ---------- Actions ----------
-static void show_msg(const char* t, const char* b) { g_msg_title = t; g_msg_body = b; g_view = VIEW_MSG; }
+static void show_msg(const char* t, const char* b) { g_msg_title = t; g_msg_body = b; g_view = VIEW_MSG; g_ui_dirty = true; }
 static void act_ble_kb()  { g_xport = XPORT_BLE; reset_screen(); g_view = VIEW_KB; }
 static void act_ble_ms()  { g_xport = XPORT_BLE; reset_screen(); g_view = VIEW_MOUSE; }
 static void act_ble_gp()  { g_xport = XPORT_BLE; reset_screen(); g_view = VIEW_PAD; }
@@ -438,6 +464,16 @@ static void act_info() {
   g_view      = VIEW_MSG;
 }
 static void act_about()   { show_msg("ABOUT", "NEXUS\nBLE + USB HID\nCardputer ESP32-S3\nnexus // cyberdeck"); }
+static char g_heap_info[128];
+static void act_memory_info() {
+  snprintf(g_heap_info, sizeof(g_heap_info),
+           "free  %u KB\nlargest %u KB\nlow   %u KB\nstack %u bytes",
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024),
+           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024),
+           (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT) / 1024),
+           (unsigned)uxTaskGetStackHighWaterMark(NULL));
+  show_msg("MEMORY", g_heap_info);
+}
 static char g_tdbg[160];
 static void act_temp_debug() {
   snprintf(g_tdbg, sizeof(g_tdbg),
@@ -469,6 +505,9 @@ static void act_card_info() {
 static void act_refresh() {
   sd_unmount();
   g_sd_ok = sd_mount();
+  if (g_sd_ok && !g_entries)
+    g_entries = (sd_entry_t*)malloc(sizeof(sd_entry_t) * SD_MAX_ENTRIES);
+  if (g_sd_ok && !g_entries) { sd_unmount(); g_sd_ok = false; }
   if (g_sd_ok && g_view == VIEW_FILES) files_reload();
   show_msg("STORAGE", g_sd_ok ? "Card remounted." : "No card found.");
 }
@@ -510,8 +549,15 @@ static void act_eviltwin() {
 // ---------- LocalServe actions ----------
 // Wireless: reuse the WiFi scan/connect flow, then start the file server on the
 // STA netif (handled in do_wifi_connect when g_serve_mode is set).
+static bool ls_prepare_wifi() {
+  if (!wifi_net_start()) return false;
+  if (!g_aps) g_aps = (wifi_ap_t*)malloc(sizeof(wifi_ap_t) * WIFI_MAX_AP);
+  if (!g_aps) { wifi_net_stop(); return false; }
+  return true;
+}
 static void act_ls_wireless() {
-  if (!wifi_net_running() || !g_aps) {
+  if (sniffer_running()) { show_msg("LOCALSERVE", "Leave LocalServe first\nto switch radio mode."); return; }
+  if (!ls_prepare_wifi()) {
     show_msg("LOCALSERVE", "WiFi not ready.\nLeave and re-enter\nLocalServe.");
     return;
   }
@@ -542,6 +588,7 @@ static void act_ls_wired() {
 // Captured data stays in RAM; only the viewer page lives on SD (/sites/sniff/).
 static void act_ls_sniffer() {
   if (!g_sd_ok) { show_msg("SNIFFER", "No SD card.\nNeed /sites/sniff/."); return; }
+  if (!wifi_net_start()) { show_msg("SNIFFER", "WiFi not ready."); return; }
   uhid_stop();
   if (!usb_net_start()) { show_msg("USB-NET FAIL", usb_net_last_err()); return; }
   if (!ls_http_start()) { show_msg("SNIFFER", "Server start failed."); return; }
@@ -571,9 +618,11 @@ static MenuItem set_items[] = {
   { "Temp Bar",  KIND_TOGGLE, 0, 0, &g_temp_on, on_temp_toggle },
   { "Temp Rate", KIND_CYCLE,  0, act_temp_rate, 0, 0, &g_temp_sec },
   { "Temp Debug",KIND_ACTION, 0, act_temp_debug, 0, 0 },
+  { "Memory",    KIND_ACTION, 0, act_memory_info, 0, 0 },
+  { "Power Save",KIND_TOGGLE, 0, 0, &g_power_save, on_power_toggle },
   { "About",     KIND_ACTION, 0, act_about, 0, 0 },
 };
-static Menu set_menu = { "SETTINGS", set_items, 6, 0, 0 };
+static Menu set_menu = { "SETTINGS", set_items, 8, 0, 0 };
 
 // USB mirrors BLE: USB > Control > Keyboard / Mouse / Gamepad (native USB HID).
 static MenuItem usb_control_items[] = {
@@ -607,7 +656,7 @@ static MenuItem wifi_items[] = {
 static Menu wifi_menu = { "WIFI", wifi_items, 4, 0, 0 };
 
 // LocalServe: host a static multi-site tree off the microSD over the network.
-// Wireless = join WiFi (STA) and serve on the LAN; Wired = USB-RNDIS (next build).
+// Wireless = join WiFi (STA); Wired = USB-NCM without starting WiFi.
 static MenuItem ls_items[] = {
   { "Wireless (WiFi)", KIND_ACTION, 0, act_ls_wireless, 0, 0 },
   { "Wired (USB-NCM)", KIND_ACTION, 0, act_ls_wired,    0, 0 },
@@ -686,7 +735,8 @@ static void draw_statusbar(const char* title) {
   // die temperature
   if (g_temp_on) {
     char ts[8];
-    snprintf(ts, sizeof(ts), "%dC", g_temp_c);
+    if (g_t_re == ESP_OK) snprintf(ts, sizeof(ts), "%dC", g_temp_c);
+    else snprintf(ts, sizeof(ts), "--C");
     uint16_t tc = (g_temp_c >= 70) ? C_RED : (g_temp_c >= 50) ? C_AMBER : C_DIM;
     canvas.setFont(&fonts::Font2);
     canvas.setTextColor(tc, C_BG);
@@ -959,13 +1009,9 @@ static void move_sel(Menu* m, int delta) {
   if (m->sel < m->top) m->top = m->sel;
   if (m->sel >= m->top + VIS) m->top = m->sel - VIS + 1;
   if (g_anim_on && old != m->sel) {
-    float from = old, to = m->sel;
-    const int frames = 5;
-    for (int f = 1; f <= frames; f++) {
-      float t = f / (float)frames;
-      draw_menu(m, from + (to - from) * t);
-      vTaskDelay(pdMS_TO_TICKS(16));
-    }
+    g_anim_menu = m;
+    g_anim_from = (float)old;
+    g_anim_start = xTaskGetTickCount();
   }
 }
 
@@ -995,7 +1041,7 @@ static void sync_storage() {
     g_sd_ok = sd_mount();
     if (g_sd_ok && !g_entries) {
       g_entries = (sd_entry_t*)malloc(sizeof(sd_entry_t) * SD_MAX_ENTRIES);
-      if (!g_entries) g_sd_ok = false;
+      if (!g_entries) { sd_unmount(); g_sd_ok = false; }
     }
   }
   if (!now && was) {
@@ -1023,16 +1069,12 @@ static void sync_wifi() {
   was = now;
 }
 
-// LocalServe mirrors the WiFi+Storage pattern: entering the subtree brings up
-// WiFi (STA) and the SD card; leaving stops the file server, WiFi and SD.
+// LocalServe mounts SD on entry; each action acquires only the network it needs.
+// Leaving stops the file server and releases USB networking, WiFi and SD.
 static void sync_localserve() {
   static bool was = false;
   bool now = stack_has(&localserve_menu);
-  if (now && !was) {
-    g_sd_ok = sd_mount();
-    if (wifi_net_start() && !g_aps)
-      g_aps = (wifi_ap_t*)malloc(sizeof(wifi_ap_t) * WIFI_MAX_AP);
-  }
+  if (now && !was) g_sd_ok = sd_mount();
   if (!now && was) {
     sniffer_stop();
     ls_http_stop();
@@ -1087,6 +1129,7 @@ static void leave_screen() {
 
 // ---------- HID screen ticks ----------
 static void kb_echo(char c) {
+  g_ui_dirty = true;
   if (c == 8) {                       // backspace trims the echo
     if (g_kblen > 0) g_kbbuf[--g_kblen] = 0;
     return;
@@ -1147,7 +1190,12 @@ static void tick_kb() {
 static void tick_mouse() {
   char h[8];
   int n = kb_scan_full(h, 8, NULL);
-  if (exit_pressed(h, n)) { leave_screen(); return; }
+  if (exit_pressed(h, n)) {
+    if (g_mouse_prev) hid_mouse(0, 0, 0, 0);  // release held buttons
+    g_mouse_prev = 0;
+    leave_screen();
+    return;
+  }
 
   // speed cycle on 's' edge (SLOW -> MED -> FAST)
   bool s_now = held_has(h, n, 's');
@@ -1175,8 +1223,13 @@ static void tick_mouse() {
     g_mouse_div = 0;
   }
 
+  int8_t whl_disp = up ? 1 : (dn ? -1 : 0);
+  static int shown_speed = -1;
+  if (btn != g_mouse_btn_disp || whl_disp != g_mouse_whl_disp ||
+      shown_speed != g_mouse_spd_i) g_ui_dirty = true;
+  shown_speed = g_mouse_spd_i;
   g_mouse_btn_disp = btn;
-  g_mouse_whl_disp = up ? 1 : (dn ? -1 : 0);
+  g_mouse_whl_disp = whl_disp;
 
   uint8_t nonzero = (dx || dy || btn || whl) ? 1 : 0;
   if (nonzero || g_mouse_prev) hid_mouse(btn, dx, dy, whl);
@@ -1206,6 +1259,7 @@ static void tick_pad() {
   if (held_has(h, n, ' ')) btns |= 1 << 6;
   if (held_has(h, n, '\n')) btns |= 1 << 7;
   if (btns != g_pad_btns || x != g_pad_x || y != g_pad_y) {
+    g_ui_dirty = true;
     hid_pad(btns, x, y);
     g_pad_btns = btns;
     g_pad_x = x;
@@ -1261,10 +1315,14 @@ static void draw_files() {
 }
 
 // Append `name` to g_path (descend into a folder).
-static void path_push(const char* name) {
+static bool path_push(const char* name) {
   size_t n = strlen(g_path);
-  if (n == 0 || g_path[n - 1] != '/') { strncat(g_path, "/", sizeof(g_path) - n - 1); n++; }
-  strncat(g_path, name, sizeof(g_path) - n - 1);
+  size_t slash = (n == 0 || g_path[n - 1] != '/') ? 1 : 0;
+  size_t len = strlen(name);
+  if (n + slash + len >= sizeof(g_path)) return false;
+  if (slash) g_path[n++] = '/';
+  memcpy(g_path + n, name, len + 1);
+  return true;
 }
 // Drop the last path component (go up). Returns false if already at root.
 static bool path_pop() {
@@ -1297,8 +1355,10 @@ static void tick_files() {
     case '\r': {
       if (g_entry_count == 0) { open_actions(); break; }
       sd_entry_t* e = &g_entries[g_file_sel];
-      if (e->is_dir) { path_push(e->name); files_reload(); }
-      else open_actions();
+      if (e->is_dir) {
+        if (path_push(e->name)) files_reload();
+        else show_msg("STORAGE", "Path too long.\nGo up a folder.");
+      } else open_actions();
       break;
     }
     case ',':
@@ -1326,6 +1386,7 @@ static void open_actions() {
 }
 
 static void begin_text(int mode, const char* preset) {
+  g_ui_dirty = true;
   g_tin_mode = mode;
   g_tin_len = 0; g_tin[0] = 0;
   if (preset) {
@@ -1346,7 +1407,10 @@ static void do_action(int code) {
   switch (code) {
     case A_OPEN:
       if (!e) break;
-      if (e->is_dir) { path_push(e->name); files_reload(); g_view = VIEW_FILES; }
+      if (e->is_dir) {
+        if (path_push(e->name)) { files_reload(); g_view = VIEW_FILES; }
+        else show_msg("STORAGE", "Path too long.\nGo up a folder.");
+      }
       else {
         char sz[16]; fmt_size(e->size, sz, sizeof(sz));
         snprintf(g_sd_info_buf, sizeof(g_sd_info_buf), "%s\nsize  %s", e->name, sz);
@@ -1371,7 +1435,7 @@ static void do_action(int code) {
 }
 
 static bool name_valid(const char* sname) {
-  if (!sname[0]) return false;
+  if (!sname[0] || !strcmp(sname, ".") || !strcmp(sname, "..")) return false;
   for (const char* q = sname; *q; q++)
     if (*q == '/' || *q == '\\' || (unsigned char)*q < 0x20) return false;
   return true;
@@ -1388,7 +1452,7 @@ static void do_wifi_connect(const char* ssid, const char* pass) {
   canvas.pushSprite(LMARGIN, 0);
   g_wifi_connected = (wifi_net_connect(ssid, pass, 12000) == 1);
   g_wifi_inet = -1;
-  if (g_wifi_connected) {
+  if (g_wifi_connected && !g_serve_mode) {
     canvas.fillSprite(C_BG);
     draw_statusbar("WiFi");
     canvas.setTextDatum(textdatum_t::middle_center);
@@ -1535,6 +1599,7 @@ static void tick_textin() {
     bool was = false;
     for (int j = 0; j < g_prev_n; j++) if (g_prev_held[j] == c) { was = true; break; }
     if (was) continue;
+    g_ui_dirty = true;
     if (c == '`') { g_prev_n = 0; g_prev_held[0] = 0;
       g_view = (g_tin_mode == TIN_WIFIPASS) ? VIEW_WIFISCAN
              : (g_tin_mode >= TIN_APSSID)   ? VIEW_MENU : VIEW_FILEACT;
@@ -2261,6 +2326,8 @@ extern "C" void app_main(void) {
   kb_init();
   batt_init();
   nvs_load();
+  apply_power();
+  if (g_pm_result != ESP_OK) g_power_save = false;
 
   boot_splash();
 
@@ -2276,6 +2343,8 @@ extern "C" void app_main(void) {
   uint32_t last_temp = last_batt;
   draw_menu(cur(), (float)cur()->sel);
 
+  AppView last_draw_view = VIEW_MENU;
+  uint32_t last_dynamic_draw = xTaskGetTickCount();
   while (true) {
     // periodic battery
     uint32_t now = xTaskGetTickCount();
@@ -2298,10 +2367,16 @@ extern "C" void app_main(void) {
     bool usb_changed = (new_usb != g_usb_state);
     g_usb_state = new_usb;
 
+    AppView drawing_view = g_view;
+    bool redraw = drawing_view != last_draw_view || batt_tick || temp_tick ||
+                  ble_changed || usb_changed;
+    if ((drawing_view == VIEW_HOTSPOT || drawing_view == VIEW_CAPTIVE ||
+         drawing_view == VIEW_SNIFF || drawing_view == VIEW_WIFISTAT) &&
+        now - last_dynamic_draw >= pdMS_TO_TICKS(1000)) redraw = true;
     switch (g_view) {
       case VIEW_MENU: {
         char k = kb_poll();
-        bool dirty = batt_tick || temp_tick || ble_changed || usb_changed;
+        bool dirty = redraw;
         if (k) {
           Menu* m = cur();
           switch (k) {
@@ -2319,32 +2394,45 @@ extern "C" void app_main(void) {
           sync_wifi();
           sync_localserve();
         }
-        if (dirty && g_view == VIEW_MENU) draw_menu(cur(), (float)cur()->sel);
+        if (g_anim_menu && (g_anim_menu != cur() || g_view != VIEW_MENU || !g_anim_on))
+          g_anim_menu = NULL;
+        float accent = (float)cur()->sel;
+        if (g_anim_menu) {
+          TickType_t elapsed = xTaskGetTickCount() - g_anim_start;
+          const TickType_t duration = pdMS_TO_TICKS(80);
+          if (elapsed >= duration) g_anim_menu = NULL;
+          else accent = g_anim_from + (accent - g_anim_from) * ((float)elapsed / duration);
+          dirty = true;
+        }
+        if (dirty && g_view == VIEW_MENU) draw_menu(cur(), accent);
         break;
       }
       case VIEW_MSG: {
         char k = kb_poll();
         if (k == ',' || k == '`') { g_view = VIEW_MENU; g_last = k; }
-        else draw_msg();
+        else if (redraw || g_ui_dirty) draw_msg();
         break;
       }
-      case VIEW_KB:    tick_kb();    if (g_view == VIEW_KB)    draw_kb_screen();    break;
-      case VIEW_MOUSE: tick_mouse(); if (g_view == VIEW_MOUSE) draw_mouse_screen(); break;
-      case VIEW_PAD:   tick_pad();   if (g_view == VIEW_PAD)   draw_pad_screen();   break;
-      case VIEW_FILES:   tick_files();   if (g_view == VIEW_FILES)   draw_files();   break;
-      case VIEW_FILEACT: tick_fileact(); if (g_view == VIEW_FILEACT) draw_fileact(); break;
-      case VIEW_TEXTIN:  tick_textin();  if (g_view == VIEW_TEXTIN)  draw_textin();  break;
-      case VIEW_CONFIRM: tick_confirm(); if (g_view == VIEW_CONFIRM) draw_confirm(); break;
-      case VIEW_DUCK:    tick_duck();    if (g_view == VIEW_DUCK)    draw_duck();    break;
-      case VIEW_DUCKRUN: tick_duckrun(); if (g_view == VIEW_DUCKRUN) draw_duckrun(); break;
-      case VIEW_WIFISCAN: tick_wifiscan(); if (g_view == VIEW_WIFISCAN) draw_wifiscan(); break;
-      case VIEW_WIFISTAT: tick_wifistat(); if (g_view == VIEW_WIFISTAT) draw_wifistat(); break;
-      case VIEW_HOTSPOT:  tick_hotspot();  if (g_view == VIEW_HOTSPOT)  draw_hotspot();  break;
-      case VIEW_CAPPICK:  tick_cappick();  if (g_view == VIEW_CAPPICK)  draw_cappick();  break;
-      case VIEW_CAPTIVE:  tick_captive();  if (g_view == VIEW_CAPTIVE)  draw_captive();  break;
-      case VIEW_SNIFF:    tick_sniff();    if (g_view == VIEW_SNIFF)    draw_sniff();    break;
+      case VIEW_KB: tick_kb(); if (g_view == VIEW_KB && (redraw || g_ui_dirty)) draw_kb_screen(); break;
+      case VIEW_MOUSE: tick_mouse(); if (g_view == VIEW_MOUSE && (redraw || g_ui_dirty)) draw_mouse_screen(); break;
+      case VIEW_PAD: tick_pad(); if (g_view == VIEW_PAD && (redraw || g_ui_dirty)) draw_pad_screen(); break;
+      case VIEW_FILES: tick_files(); if (g_view == VIEW_FILES && (redraw || g_ui_dirty)) draw_files(); break;
+      case VIEW_FILEACT: tick_fileact(); if (g_view == VIEW_FILEACT && (redraw || g_ui_dirty)) draw_fileact(); break;
+      case VIEW_TEXTIN: tick_textin(); if (g_view == VIEW_TEXTIN && (redraw || g_ui_dirty)) draw_textin(); break;
+      case VIEW_CONFIRM: tick_confirm(); if (g_view == VIEW_CONFIRM && (redraw || g_ui_dirty)) draw_confirm(); break;
+      case VIEW_DUCK: tick_duck(); if (g_view == VIEW_DUCK && (redraw || g_ui_dirty)) draw_duck(); break;
+      case VIEW_DUCKRUN: tick_duckrun(); if (g_view == VIEW_DUCKRUN && (redraw || g_ui_dirty)) draw_duckrun(); break;
+      case VIEW_WIFISCAN: tick_wifiscan(); if (g_view == VIEW_WIFISCAN && (redraw || g_ui_dirty)) draw_wifiscan(); break;
+      case VIEW_WIFISTAT: tick_wifistat(); if (g_view == VIEW_WIFISTAT && (redraw || g_ui_dirty)) draw_wifistat(); break;
+      case VIEW_HOTSPOT: tick_hotspot(); if (g_view == VIEW_HOTSPOT && (redraw || g_ui_dirty)) draw_hotspot(); break;
+      case VIEW_CAPPICK: tick_cappick(); if (g_view == VIEW_CAPPICK && (redraw || g_ui_dirty)) draw_cappick(); break;
+      case VIEW_CAPTIVE: tick_captive(); if (g_view == VIEW_CAPTIVE && (redraw || g_ui_dirty)) draw_captive(); break;
+      case VIEW_SNIFF: tick_sniff(); if (g_view == VIEW_SNIFF && (redraw || g_ui_dirty)) draw_sniff(); break;
       default: break;
     }
+    if (redraw || g_ui_dirty) last_dynamic_draw = now;
+    last_draw_view = drawing_view;
+    g_ui_dirty = false;
     vTaskDelay(pdMS_TO_TICKS(16));
   }
 }
