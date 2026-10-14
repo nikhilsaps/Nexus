@@ -2185,6 +2185,7 @@ static void tick_sniff() {
 // ======================= CAPTIVE PORTAL =======================
 #define CAP_MAX      64
 #define CAP_HTML_MAX 24576
+#define CAPTIVE_ROOT "/sites/captive"   // packed under the web root (sibling of /sites/sniff)
 static sd_entry_t* g_cap = 0;
 static int  g_cap_count = 0, g_cap_sel = 0, g_cap_top = 0;
 static bool g_cap_sd = false;
@@ -2203,11 +2204,12 @@ static void cap_cleanup_sd() {
 static void cap_open_picker() {
   g_cap_count = 0; g_cap_sel = 0; g_cap_top = 0;
   g_cap_sd = sd_mount();
-  if (!g_cap_sd) { show_msg("EVIL-TWIN", "No SD card.\nNeed /captive/*.html"); return; }
-  sd_make_dir("/captive");
+  if (!g_cap_sd) { show_msg("EVIL-TWIN", "No SD card.\nNeed " CAPTIVE_ROOT "/*.html"); return; }
+  sd_make_dir("/sites");            // web root; harmless if it exists
+  sd_make_dir(CAPTIVE_ROOT);
   if (!g_cap) g_cap = (sd_entry_t*)malloc(sizeof(sd_entry_t) * CAP_MAX);
   if (!g_cap) { cap_cleanup_sd(); show_msg("EVIL-TWIN", "Out of memory."); return; }
-  bool t; int n = sd_list("/captive", g_cap, CAP_MAX, &t);
+  bool t; int n = sd_list(CAPTIVE_ROOT, g_cap, CAP_MAX, &t);
   int w = 0;
   for (int i = 0; i < n; i++)
     if (!g_cap[i].is_dir && ends_html(g_cap[i].name)) { if (w != i) g_cap[w] = g_cap[i]; w++; }
@@ -2218,7 +2220,7 @@ static void cap_open_picker() {
 static void cap_launch(int idx) {
   if (idx < 0 || idx >= g_cap_count) return;
   char path[128];
-  snprintf(path, sizeof(path), "/captive/%s", g_cap[idx].name);
+  snprintf(path, sizeof(path), CAPTIVE_ROOT "/%s", g_cap[idx].name);
   if (!g_cap_html) g_cap_html = (char*)malloc(CAP_HTML_MAX);
   if (!g_cap_html) { cap_cleanup_sd(); show_msg("EVIL-TWIN", "Out of memory."); return; }
   int r = sd_read_file(path, g_cap_html, CAP_HTML_MAX);
@@ -2246,7 +2248,7 @@ static void draw_cappick() {
   if (g_cap_count == 0) {
     canvas.setTextColor(C_DIM, C_BG);
     canvas.setTextDatum(textdatum_t::top_left);
-    canvas.drawString("no pages in /captive", 12, LIST_Y + 4);
+    canvas.drawString("no pages in " CAPTIVE_ROOT, 12, LIST_Y + 4);
     canvas.drawString("add .html files", 12, LIST_Y + 26);
   }
   for (int i = 0; i < VIS; i++) {

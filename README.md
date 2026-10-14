@@ -148,7 +148,7 @@ mutually exclusive with BLE/USB by design.
 - **Hotspot** - a SoftAP with a name and password you choose (8+ chars = WPA2,
   blank = open). Shows the SSID, password, AP IP and a live client count.
 - **Evil-Twin** - scan nearby Wi-Fi, pick a network to **clone its SSID**, then
-  choose an `.html` page from the `/captive` folder. Nexus stands up an open AP
+  choose an `.html` page from the `/sites/captive` folder. Nexus stands up an open AP
   with the cloned name, a DNS catch-all (every lookup resolves to the device),
   and a web server that serves your page to anyone who joins. Live clients +
   page-hit counters. (A device auto-joins only if the real network it trusts was
