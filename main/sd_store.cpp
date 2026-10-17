@@ -157,6 +157,30 @@ bool sd_make_file(const char *path) {
   return true;
 }
 
+bool sd_append_file(const char *path, const char *data, int len) {
+  if (!s_card || !data) return false;
+  if (len < 0) len = (int)strlen(data);
+  char ab[400]; abspath(path, ab, sizeof(ab));
+  FILE *f = fopen(ab, "ab");       // append, create if absent
+  if (!f) return false;
+  size_t w = fwrite(data, 1, (size_t)len, f);
+  fflush(f);
+  fclose(f);
+  return (int)w == len;
+}
+
+bool sd_write_file(const char *path, const char *data, int len) {
+  if (!s_card || !data) return false;
+  if (len < 0) len = (int)strlen(data);
+  char ab[400]; abspath(path, ab, sizeof(ab));
+  FILE *f = fopen(ab, "wb");       // overwrite / create
+  if (!f) return false;
+  size_t w = fwrite(data, 1, (size_t)len, f);
+  fflush(f);
+  fclose(f);
+  return (int)w == len;
+}
+
 bool sd_make_dir(const char *path) {
   if (!s_card) return false;
   char ab[400]; abspath(path, ab, sizeof(ab));

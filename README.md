@@ -5,8 +5,9 @@
 Nexus turns the Cardputer into a self-contained field tool: a **BLE / USB HID
 device** (keyboard, mouse, gamepad), a **BadUSB / Ducky** payload runner, a
 **microSD file browser**, and a full **Wi-Fi toolkit** (scanner, connect +
-internet test, hotspot, and a captive portal) - all behind one clean,
-keyboard-driven UI.
+internet test, hotspot, captive / Evil-Twin portal, passive sniffer, plus
+active deauth / beacon / Karma and BLE pairing-prompt spam) - all behind one
+clean, keyboard-driven UI.
 
 Built on bare **ESP-IDF v5.4** (no Arduino): **M5GFX** for the display,
 **NimBLE** for Bluetooth, **TinyUSB** for native USB HID, and **esp_wifi /
@@ -26,7 +27,8 @@ lwIP** for networking.
 | **USB HID**   | The same three controllers over a native USB-C cable (no pairing). |
 | **Ducky**     | Runs DuckyScript payloads from the SD card over either BLE or USB. |
 | **Storage**   | Browse / create / rename / delete files and folders on a microSD card. |
-| **Wi-Fi**     | Scan networks, join one and verify real internet, run a hotspot, host a captive/Evil-Twin portal, or passively sniff nearby probes/clients. Plus a live signal meter and NTP clock sync. |
+| **Wi-Fi**     | Scan networks, join one and verify real internet, run a hotspot, host a captive / Evil-Twin portal (with optional login capture), or passively sniff nearby probes/clients. Plus a live signal meter and NTP clock sync. |
+| **RF attacks** | Wi-Fi **deauth** (broadcast or per-client, with associated-station discovery), **beacon** SSID spam, a **Karma** probe-response lure, and **BLE pairing-prompt spam** (Apple / Microsoft / Google). Own-gear / lab testing only. |
 | **LocalServe** | Host static sites straight off the SD card - over Wi-Fi or a plain USB-C cable (USB-NCM). The Cardputer becomes a tiny web host. |
 
 Everything is **lazy and mutually exclusive**: a radio or the SD card is powered
@@ -151,9 +153,43 @@ mutually exclusive with BLE/USB by design.
   choose an `.html` page from the `/sites/captive` folder. Nexus stands up an open AP
   with the cloned name, a DNS catch-all (every lookup resolves to the device),
   and a web server that serves your page to anyone who joins. Live clients +
-  page-hit counters. (A device auto-joins only if the real network it trusts was
-  itself open; same-name WPA2 networks will not downgrade, and Nexus has no
-  deauth. Lab/own-gear use only.)
+  page-hit counters. Press `g` on the page picker to drop three built-in phishing
+  templates (`wifi.html`, `router.html`, `signin.html`) onto the card; any login
+  form POSTed by a joined client is written to `/sites/captive/creds.log` and the
+  screen shows a running **saved** count. (A device auto-joins on its own only if
+  the trusted network was itself open; same-name WPA2 networks will not downgrade.
+  Pair with **Deauth** to nudge clients off the real AP. Lab / own-gear use only.)
+
+### RF attacks (lab / own-gear testing only)
+
+These are **active** radio tools: they transmit, and in many places using them
+against networks or devices you do not own is illegal. Keep them for your own
+hardware, a lab, or explicit written authorization. All share the lazy teardown
+rule - a tool runs only while you are on its screen and stops the moment you
+leave (`,` or `` ` ``).
+
+- **Wi-Fi > Deauth** - pick an AP from a scan, then Nexus passively discovers the
+  **stations associated with it** (vendor-labelled, with RSSI and packet counts).
+  Press `d` to deauth a selected client, or broadcast (`FF:FF:...`) to knock
+  **every** client off, while the radio is parked on the AP's channel. Raw
+  deauth / disassoc management frames are injected with `esp_wifi_80211_tx`; a
+  program-wide `ieee80211_raw_frame_sanity_check()` override (plus the linker
+  `--allow-multiple-definition` flag in `main/CMakeLists.txt`) lets them past the
+  IDF frame filter. Live frames-sent counter.
+- **Wi-Fi > Beacon** - floods 802.11 beacon frames for a built-in list of fake
+  SSIDs, rotating channels 1 / 6 / 11 so they appear in nearby Wi-Fi lists. Each
+  SSID keeps a stable locally-administered BSSID so it shows as one steady
+  network. Live beacon count + channel.
+- **Wi-Fi > Karma** - a probe-response lure: it listens for **directed probe
+  requests** (phones hunting for their saved networks), harvests those SSIDs, and
+  floods beacons + probe responses for each so the "known" networks appear in
+  range and clients lean toward them. Shows harvested-SSID and frames-sent
+  counts.
+- **BLE > BLE Spam** - rapidly broadcasts fake pairing / proximity advertisements
+  with a fresh random address each burst, popping "connect new device" prompts on
+  nearby phones and PCs: Apple iOS proximity-pair, Windows Swift Pair, and Android
+  Fast Pair (or all three at once). It borrows the NimBLE host from BLE HID, so it
+  is **mutually exclusive with `BLE > Control`**. Live advertisements-sent counter.
 
 ### LocalServe
 
@@ -196,6 +232,25 @@ sortable table with CSV / JSON download. Open `http://192.168.7.1/sniff/` on
 the wired PC. (Receive-only and lawful; the Evil-Twin step is the active part -
 own gear only.)
 
+---
+
+## Companion repo: Nexus-Extras
+
+The firmware is only half the kit. Everything Nexus *serves* lives in a separate
+repo, **[Nexus-Extras](https://github.com/nikhilsaps/Nexus-Extras)** (the "Nexus
+Sites" project): the microSD web root under `sites/` (the LocalServe launcher,
+the Chess Master app, the Wi-Fi Sniffer viewer, and the Evil-Twin captive-portal
+pages) plus the BadUSB payloads under `duck/`.
+
+- **LocalServe** serves `sites/` straight off the card at `http://<device-ip>/`.
+- **Evil-Twin** picks its pages from `sites/captive/`.
+- **Wi-Fi Sniffer** streams into the viewer at `sites/sniff/index.html`.
+- **Ducky** runs the `.txt` payloads from `duck/`.
+
+Clone Nexus-Extras, build its apps, and deploy the tree to the card with its
+`scripts/deploy.py` so the SD contents match this firmware's expectations. See
+that repo's README for the full build-and-deploy flow.
+
 ## Hardware
 
 - **Device:** M5Stack Cardputer (M5StampS3 / ESP32-S3FN8, 8 MB flash, **no PSRAM**)
@@ -231,8 +286,11 @@ flowchart TD
     HID --> USB["usb_hid (TinyUSB)"]
     UI --> SD["sd_store (microSD, SPI2)"]
     UI --> WIFI["wifi_net (esp_wifi / lwIP)"]
-    WIFI --> AP["SoftAP + HTTP server + DNS (captive portal)"]
+    WIFI --> AP["SoftAP + HTTP server + DNS (captive portal + login capture)"]
     WIFI --> STA["STA scan / connect / internet probe / NTP"]
+    WIFI --> SNIFF["sniffer (promiscuous probe/client logger)"]
+    WIFI --> RF["deauther / beacon / karma (raw esp_wifi_80211_tx)"]
+    BLE --> BSPAM["blespam (pairing-prompt advertisements)"]
     UI --> LS["localserve (HTTP server, serves /sites off SD)"]
     LS --> LSW["Wi-Fi link (reuses wifi_net STA)"]
     LS --> LSU["usb_net (USB-CDC-NCM + DHCP, 192.168.7.1)"]
@@ -257,6 +315,10 @@ Nexus/
     localserve.cpp/.h   SD-hosted static web server (/sites over the LAN)
     usb_net.cpp/.h      USB-CDC-NCM adapter + esp_netif gateway + DHCP (Wired)
     sniffer.cpp/.h      promiscuous Wi-Fi sniffer + probe/client logger (RAM)
+    deauther.cpp/.h     802.11 deauth/disassoc TX + associated-station discovery
+    beacon.cpp/.h       802.11 beacon-spam transmitter (fake SSIDs, ch 1/6/11)
+    karma.cpp/.h        Karma probe-response lure (harvest + respond)
+    blespam.cpp/.h      BLE pairing-prompt advertisement spam (NimBLE)
 ```
 
 ---

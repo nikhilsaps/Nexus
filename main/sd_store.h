@@ -35,6 +35,8 @@ int sd_list(const char *path, sd_entry_t *entries, int max_entries, bool *trunca
 
 // Write ops. Paths are card-relative (leading "/"). All return success.
 bool sd_make_file(const char *path);          // create an empty file
+bool sd_append_file(const char *path, const char *data, int len); // append (create if absent); len<0 = strlen
+bool sd_write_file(const char *path, const char *data, int len);  // overwrite/create; len<0 = strlen
 bool sd_make_dir(const char *path);           // create a directory
 bool sd_delete(const char *path, bool is_dir);// unlink file / rmdir (empty) folder
 bool sd_rename(const char *oldp, const char *newp);

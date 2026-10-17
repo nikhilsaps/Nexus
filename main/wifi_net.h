@@ -51,6 +51,11 @@ bool   wifi_net_sntp_sync(char* out, int len);
 bool   wifi_net_cp_start(const char* ssid, const char* html, int htmllen);
 void   wifi_net_cp_stop(void);
 int    wifi_net_cp_hits(void);
+int    wifi_net_cp_caps(void);   /* login forms submitted */
+
+/* Register a callback fired on each captive-portal form POST. body is the
+   urlencoded form data (NUL-terminated), ip the client dotted address. */
+void   wifi_net_cp_set_capture(void (*cb)(const char* body, const char* ip));
 
 size_t wifi_net_free_heap(void);
 const char* wifi_net_auth_str(uint8_t authmode);
