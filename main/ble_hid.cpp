@@ -2,6 +2,7 @@
 #include "ble_hid.h"
 #include "esp_hidd.h"
 #include "esp_hid_gap.h"
+#include "esp_bt.h"
 #include "esp_log.h"
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -121,6 +122,24 @@ void bhid_stop(void) {
         ble_gap_terminate(g_nexus_conn, 0x13 /* remote user terminated */);
     }
     ble_gap_adv_stop();
+}
+
+// Reversible full teardown: free the NimBLE host + BT controller heap. A later
+// bhid_start() re-inits via bhid_bringup(). NOTE: deliberately does NOT call
+// esp_bt_mem_release(ESP_BT_MODE_BLE) — that is irreversible until reboot.
+void bhid_release(void) {
+    if (!s_up) return;
+    s_want = false;
+    if (s_connected && g_nexus_conn != 0xFFFF)
+        ble_gap_terminate(g_nexus_conn, 0x13);
+    ble_gap_adv_stop();
+    nimble_port_stop();          // unblocks nimble_port_run() in host_task,
+                                 // which then calls nimble_port_freertos_deinit()
+    nimble_port_deinit();        // free the NimBLE host
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();  // return the controller heap to the pool
+    s_up = false;
+    s_connected = false;
 }
 
 bool bhid_active(void)    { return s_want; }

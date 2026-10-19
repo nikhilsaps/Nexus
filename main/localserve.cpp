@@ -9,8 +9,15 @@
 #include "esp_log.h"
 #include "safe_replace.h"
 #include "sniffer.h"
+#include "ble_hid.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
+#include <ctype.h>
 
 static const char* TAG = "localserve";
+static volatile bool g_ls_served = false;  // set on first client request
 #define SITES_ROOT   "/sdcard/sites"
 #define CHUNK        4096
 #define URL_MAX      1024                                   // longest URL path accepted
@@ -175,6 +182,7 @@ static send_res_t send_file(httpd_req_t* req, const char* fspath, const char* ur
 }
 
 static esp_err_t get_handler(httpd_req_t* req) {
+  g_ls_served = true;
   char* url = (char*)malloc(URL_MAX);
   char* fs  = (char*)malloc(FSPATH_MAX);
   char* gzp = (char*)malloc(FSPATH_MAX);
@@ -254,6 +262,7 @@ done:
 // only closing the connection stops the unread remainder from being parsed as
 // the next request on a keep-alive socket.
 static esp_err_t save_handler(httpd_req_t* req) {
+  g_ls_served = true;
   char* rel = (char*)malloc(URL_MAX);
   char* dst = (char*)malloc(FSPATH_MAX);
   char* tmp = (char*)malloc(FSPATH_MAX);
@@ -369,6 +378,7 @@ fail:
 
 // GET /api/sniff.json : live WiFi-sniffer table, straight from RAM (never SD).
 static esp_err_t sniff_handler(httpd_req_t* req) {
+  g_ls_served = true;
   const size_t cap = 10240;  // 48 devices * ~170 bytes/row + header
   char* buf = (char*)malloc(cap);
   if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_OK; }
@@ -381,13 +391,135 @@ static esp_err_t sniff_handler(httpd_req_t* req) {
   return ESP_OK;
 }
 
+// --- URL-decode in place (%XX and +). Used by the /api/fetch proxy. ---
+static int ls_hexv(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  c |= 0x20;
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  return -1;
+}
+static void ls_url_decode(char* str) {
+  char* o = str;
+  for (char* p = str; *p; ) {
+    if (*p == '%') { int h = ls_hexv(p[1]), l = ls_hexv(p[2]);
+      if (h >= 0 && l >= 0) { *o++ = (char)(h * 16 + l); p += 3; continue; } }
+    if (*p == '+') { *o++ = ' '; p++; continue; }
+    *o++ = *p++;
+  }
+  *o = 0;
+}
+
+// GET /api/fetch?url=<enc>&ref=<enc>&ua=<enc> : HTTPS proxy. Opens the target
+// over TLS (cert bundle), streams the raw body straight back through one reused
+// static buffer. Kills CORS because the browser only ever talks to this origin.
+// The ESP never parses or fully buffers the body (fits 512KB-RAM, no PSRAM).
+static esp_err_t fetch_handler(httpd_req_t* req) {
+  g_ls_served = true;
+  size_t qlen = httpd_req_get_url_query_len(req) + 1;
+  if (qlen <= 1) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no query"); return ESP_OK; }
+  if (qlen > 1500) qlen = 1500;
+  char* q = (char*)malloc(qlen);
+  if (!q) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_OK; }
+  httpd_req_get_url_query_str(req, q, qlen);
+
+  char url[1024] = {0}, ref[512] = {0}, ua[256] = {0};
+  httpd_query_key_value(q, "url", url, sizeof url);
+  httpd_query_key_value(q, "ref", ref, sizeof ref);
+  httpd_query_key_value(q, "ua",  ua,  sizeof ua);
+  free(q);
+  ls_url_decode(url); ls_url_decode(ref); ls_url_decode(ua);
+  if (strncmp(url, "https://", 8) != 0 && strncmp(url, "http://", 7) != 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad url"); return ESP_OK;
+  }
+
+  esp_http_client_config_t cfg = {};
+  cfg.url               = url;
+  cfg.crt_bundle_attach = esp_crt_bundle_attach;
+  cfg.timeout_ms        = 15000;
+  cfg.buffer_size       = 1460;
+  cfg.buffer_size_tx    = 1024;
+  cfg.user_agent        = ua[0] ? ua : "Mozilla/5.0 (Nexus LocalServe)";
+  bool is_post          = (req->method == HTTP_POST);
+  cfg.method            = is_post ? HTTP_METHOD_POST : HTTP_METHOD_GET;
+  esp_http_client_handle_t cl = esp_http_client_init(&cfg);
+  if (!cl) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "client init"); return ESP_OK; }
+  if (ref[0]) esp_http_client_set_header(cl, "Referer", ref);
+
+  static char io[2048];   // reused, single-worker httpd: no per-request alloc
+
+  if (is_post) {
+    // Relay the incoming body + Content-Type to the upstream as a POST.
+    char ctin[128] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", ctin, sizeof ctin) == ESP_OK && ctin[0])
+      esp_http_client_set_header(cl, "Content-Type", ctin);
+    int total = req->content_len;
+    if (esp_http_client_open(cl, total) != ESP_OK) {
+      esp_http_client_cleanup(cl);
+      httpd_resp_set_status(req, "502 Bad Gateway");
+      httpd_resp_set_type(req, "application/json");
+      httpd_resp_sendstr(req, "{\"error\":\"upstream connect failed\"}");
+      return ESP_OK;
+    }
+    int left = total;
+    while (left > 0) {
+      int want = left < (int)sizeof io ? left : (int)sizeof io;
+      int r = httpd_req_recv(req, io, want);
+      if (r <= 0) { esp_http_client_cleanup(cl); return ESP_FAIL; }
+      if (esp_http_client_write(cl, io, r) < 0) { esp_http_client_cleanup(cl); return ESP_FAIL; }
+      left -= r;
+    }
+  } else {
+    if (esp_http_client_open(cl, 0) != ESP_OK) {
+      esp_http_client_cleanup(cl);
+      httpd_resp_set_status(req, "502 Bad Gateway");
+      httpd_resp_set_type(req, "application/json");
+      httpd_resp_sendstr(req, "{\"error\":\"upstream connect failed\"}");
+      return ESP_OK;
+    }
+  }
+  esp_http_client_fetch_headers(cl);
+
+  char ctbuf[128] = "application/octet-stream";
+  char* ct = NULL;
+  if (esp_http_client_get_header(cl, "Content-Type", &ct) == ESP_OK && ct && ct[0]) {
+    strncpy(ctbuf, ct, sizeof(ctbuf) - 1); ctbuf[sizeof(ctbuf) - 1] = 0;
+  }
+  httpd_resp_set_type(req, ctbuf);
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  int n; bool sock_ok = true;
+  while ((n = esp_http_client_read(cl, io, sizeof io)) > 0) {
+    if (httpd_resp_send_chunk(req, io, n) != ESP_OK) { sock_ok = false; break; }
+  }
+  esp_http_client_close(cl);
+  esp_http_client_cleanup(cl);
+  if (sock_ok) httpd_resp_send_chunk(req, NULL, 0);
+  return ESP_OK;
+}
+
+// GET /api/stat : live heap report, so the UI can watch free RAM.
+static esp_err_t stat_handler(httpd_req_t* req) {
+  g_ls_served = true;
+  char body[160];
+  snprintf(body, sizeof body,
+    "{\"free\":%u,\"min_free\":%u,\"largest_block\":%u}",
+    (unsigned)esp_get_free_heap_size(),
+    (unsigned)esp_get_minimum_free_heap_size(),
+    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  httpd_resp_sendstr(req, body);
+  return ESP_OK;
+}
+
 bool ls_http_start(void) {
   if (g_srv) return true;
+  bhid_release();   // reclaim NimBLE host+controller heap if a BLE module ran
+  g_ls_served = false;   // fresh session: no client has connected yet
   httpd_config_t hc        = HTTPD_DEFAULT_CONFIG();
   hc.uri_match_fn          = httpd_uri_match_wildcard;
   hc.stack_size            = 10240;   // FATFS/SPI + heap path bufs need headroom
   hc.lru_purge_enable      = true;
-  hc.max_uri_handlers      = 5;
+  hc.max_uri_handlers      = 8;
   hc.recv_wait_timeout     = 10;
   hc.send_wait_timeout     = 10;
   if (httpd_start(&g_srv, &hc) != ESP_OK) { g_srv = 0; return false; }
@@ -395,12 +527,15 @@ bool ls_http_start(void) {
   httpd_uri_t save_put  = {}; save_put.uri  = "/api/save/*";    save_put.method  = HTTP_PUT;  save_put.handler  = save_handler;
   httpd_uri_t save_post = {}; save_post.uri = "/api/save/*";    save_post.method = HTTP_POST; save_post.handler = save_handler;
   httpd_uri_t sniff     = {}; sniff.uri     = "/api/sniff.json"; sniff.method    = HTTP_GET;  sniff.handler     = sniff_handler;
+  httpd_uri_t fetch     = {}; fetch.uri     = "/api/fetch";     fetch.method     = HTTP_GET;  fetch.handler     = fetch_handler;
+  httpd_uri_t fetch_p   = {}; fetch_p.uri   = "/api/fetch";     fetch_p.method   = HTTP_POST; fetch_p.handler   = fetch_handler;
+  httpd_uri_t stat      = {}; stat.uri      = "/api/stat";      stat.method      = HTTP_GET;  stat.handler      = stat_handler;
   httpd_uri_t getall    = {}; getall.uri    = "/*";             getall.method    = HTTP_GET;  getall.handler    = get_handler;
 
   // The wildcard GET handler shadows everything, so a partially registered
   // server would silently serve 404s for /api/save instead of saving. Unwind
   // instead: a server that cannot route all four URIs must not come up.
-  const httpd_uri_t* uris[] = { &save_put, &save_post, &sniff, &getall };
+  const httpd_uri_t* uris[] = { &save_put, &save_post, &sniff, &fetch, &fetch_p, &stat, &getall };
   for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
     esp_err_t e = httpd_register_uri_handler(g_srv, uris[i]);
     if (e != ESP_OK) {
@@ -419,3 +554,7 @@ void ls_http_stop(void) {
 }
 
 bool ls_http_running(void) { return g_srv != 0; }
+
+// True once any client has made a request this session (used by the UI to
+// free the display framebuffer and hand its RAM to TLS/the proxy).
+bool ls_http_served(void) { return g_ls_served; }

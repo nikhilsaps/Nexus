@@ -23,6 +23,7 @@ typedef struct {
 bool sd_mount(void);
 void sd_unmount(void);
 bool sd_mounted(void);
+const char* sd_mount_point(void);   // VFS base, e.g. "/sdcard"
 
 // Card + filesystem info. Returns false if not mounted.
 bool sd_info(char *card_name, size_t name_len,

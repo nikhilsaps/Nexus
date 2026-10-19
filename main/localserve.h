@@ -15,6 +15,7 @@ extern "C" {
 bool ls_http_start(void);   // start esp_http_server (idempotent). false on fail.
 void ls_http_stop(void);    // stop + free the server (idempotent).
 bool ls_http_running(void);
+bool ls_http_served(void);  // true after the first client request this session
 
 #ifdef __cplusplus
 }

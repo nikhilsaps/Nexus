@@ -331,6 +331,7 @@ static char        g_ap_pass[64];
 static bool        g_wifi_connected = false;
 static int         g_wifi_inet = -1;   // -1 unknown, 0 no, 1 yes
 static bool        g_serve_mode = false;  // true = this WiFi session is a LocalServe host
+static bool        g_display_off = false; // true = display freed+asleep for LocalServe RAM
 static bool        g_evil_mode  = false;  // true = scan pick clones SSID into the open AP (Evil-Twin)
 static bool        g_deauth_mode = false; // true = scan pick becomes the deauth target
 // Deauth target AP + station picker state (clients discovered on the AP channel).
@@ -343,8 +344,6 @@ static bool        g_sta_all = true;             // row 0 = ALL (broadcast)
 static int         g_sta_cur = 0;                // highlighted row (0 = ALL)
 static int         g_sta_top = 0;
 static char        g_cap_name[WIFI_SSID_MAX];
-static char*       g_cap_html = 0;
-static int         g_cap_html_len = 0;
 static void        wifi_scan_now();   // defined with the draw helpers
 
 // Build a card-relative path for `name` inside the current g_path.
@@ -2475,7 +2474,6 @@ static void tick_karma() {
 
 // ======================= CAPTIVE PORTAL =======================
 #define CAP_MAX      64
-#define CAP_HTML_MAX 24576
 #define CAPTIVE_ROOT "/sites/captive"   // packed under the web root (sibling of /sites/sniff)
 static sd_entry_t* g_cap = 0;
 static int  g_cap_count = 0, g_cap_sel = 0, g_cap_top = 0;
@@ -2570,18 +2568,14 @@ static void cap_open_picker() {
 
 static void cap_launch(int idx) {
   if (idx < 0 || idx >= g_cap_count) return;
-  char path[128];
-  snprintf(path, sizeof(path), CAPTIVE_ROOT "/%s", g_cap[idx].name);
-  if (!g_cap_html) g_cap_html = (char*)malloc(CAP_HTML_MAX);
-  if (!g_cap_html) { cap_cleanup_sd(); show_msg("EVIL-TWIN", "Out of memory."); return; }
-  int r = sd_read_file(path, g_cap_html, CAP_HTML_MAX);
-  cap_free_list();                  // page is in RAM; keep SD mounted for the cred log
-  if (r < 0) { free(g_cap_html); g_cap_html = 0; show_msg("EVIL-TWIN", "Read failed."); return; }
-  g_cap_html_len = r;
+  // The chosen file becomes the site index; the server streams it (and any
+  // sibling asset) straight off SD, so there is no page buffer to allocate.
+  char index[SD_NAME_MAX];
+  snprintf(index, sizeof(index), "%s", g_cap[idx].name);
+  cap_free_list();                  // picker list done; SD stays mounted for serving + cred log
   g_cred_seq = 0;
   wifi_net_cp_set_capture(cp_capture);
-  if (!wifi_net_cp_start(g_cap_name, g_cap_html, g_cap_html_len)) {
-    free(g_cap_html); g_cap_html = 0;
+  if (!wifi_net_cp_start(g_cap_name, CAPTIVE_ROOT, index)) {
     show_msg("EVIL-TWIN", "Failed to start\ncaptive portal.");
     return;
   }
@@ -2591,9 +2585,7 @@ static void cap_launch(int idx) {
 static void cap_stop() {
   wifi_net_cp_stop();          // safe even if portal was never started
   wifi_net_cp_set_capture(0);
-  if (g_cap_html) { free(g_cap_html); g_cap_html = 0; }
-  g_cap_html_len = 0;
-  cap_cleanup_sd();            // release the SD held open for the cred log
+  cap_cleanup_sd();            // release the SD held open for serving + the cred log
 }
 
 static void draw_cappick() {
@@ -2708,6 +2700,17 @@ extern "C" void app_main(void) {
   while (true) {
     // periodic battery
     uint32_t now = xTaskGetTickCount();
+    // Universal LocalServe RAM-reclaim: once any device has hit the HTTP server,
+    // free the ~63KB canvas sprite and power down the display to hand contiguous
+    // RAM to TLS/proxy. Exit is a physical restart (clean boot restores everything).
+    if (!g_display_off && ls_http_running() && ls_http_served()) {
+      canvas.deleteSprite();
+      display.fillScreen(0);
+      display.setBrightness(0);
+      display.sleep();
+      g_display_off = true;
+    }
+    if (g_display_off) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
     bool batt_tick = false;
     if (now - last_batt >= pdMS_TO_TICKS(2000)) {
       batt_sample();

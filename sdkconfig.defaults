@@ -20,3 +20,23 @@ CONFIG_TINYUSB_NET_MODE_NCM=y
 # FATFS long filenames for the microSD browser (Storage)
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
+# HTTP server: real phones/browsers send >512B of request headers (captive
+# portal probes + cookies). Bump the request buffers so they aren't rejected
+# with "Header too long". URI buffer raised to match.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
+CONFIG_HTTPD_MAX_URI_LEN=1024
+# --- Akashic / LocalServe: RAM + HTTPS-proxy tuning ---
+# Smaller code (-Os): frees flash and some RAM
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+# Trim WiFi buffers (reader app is low-bandwidth/bursty, not a throughput load)
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+# mbedTLS: free handshake scratch + shrink I/O buffers so the /api/fetch HTTPS
+# proxy fits in 512KB-RAM (no PSRAM); cert bundle = no per-site cert pinning
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# Smaller printf + quieter logs
+CONFIG_NEWLIB_NANO_FORMAT=y
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y

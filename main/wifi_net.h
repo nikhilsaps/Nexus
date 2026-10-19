@@ -47,8 +47,12 @@ bool   wifi_net_ap_ipinfo(char* ip, int len);
 /* Sync clock from NTP (needs internet). Writes "YYYY-MM-DD HH:MM:SS IST". */
 bool   wifi_net_sntp_sync(char* out, int len);
 
-/* Captive portal: open SoftAP named ssid + DNS catch-all + HTTP serving html. */
-bool   wifi_net_cp_start(const char* ssid, const char* html, int htmllen);
+/* Captive portal / mini web server: open SoftAP named ssid + DNS catch-all,
+   then serve the site in SD dir webroot. index is served for "/" and for any
+   path that does not resolve to a real file (so OS captive-portal probes get
+   redirected). A JSON store is exposed under /api/<name>: GET reads, POST/PUT
+   writes, DELETE removes a file in "/sites/data". */
+bool   wifi_net_cp_start(const char* ssid, const char* webroot, const char* index);
 void   wifi_net_cp_stop(void);
 int    wifi_net_cp_hits(void);
 int    wifi_net_cp_caps(void);   /* login forms submitted */

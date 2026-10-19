@@ -143,6 +143,8 @@ int sd_list(const char *path, sd_entry_t *entries, int max_entries, bool *trunca
 
 
 // ---------- Write ops ----------
+const char* sd_mount_point(void) { return MOUNT_POINT; }
+
 static void abspath(const char *rel, char *out, size_t n) {
   snprintf(out, n, "%s%s", MOUNT_POINT, (rel && rel[0]) ? rel : "/");
 }

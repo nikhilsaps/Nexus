@@ -11,6 +11,11 @@ extern "C" {
 void bhid_start(const char* name);
 // Stop BLE: drop any active link and stop advertising (stack stays up).
 void bhid_stop(void);
+// Fully release BLE: stop advertising, tear down the NimBLE host and the BT
+// controller, returning their heap to the pool. Reversible: a later
+// bhid_start() brings the stack back up. Call when switching to a RAM-hungry
+// mode (e.g. LocalServe) after a BLE module ran.
+void bhid_release(void);
 // True while advertising is wanted (device is "on").
 bool bhid_active(void);
 // True once a central is connected and the link is encrypted.

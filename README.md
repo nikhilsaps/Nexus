@@ -209,9 +209,81 @@ cable.
   `192.168.7.1/24` link, and serves `/sites` at `http://192.168.7.1/`. Like USB
   HID it claims the shared USB-OTG port, so the serial console drops while it is
   active; restart to return to flashable serial mode.
+- **HTTP proxy (`/api/fetch`)** - a dumb pass-through so a served page can reach
+  any site without CORS. `GET /api/fetch?url=<abs http(s) url>` streams the
+  upstream body straight back; `POST /api/fetch?url=...` relays the request body
+  + `Content-Type` to the upstream. Optional `ref=`/`ua=` query params set the
+  upstream `Referer`/`User-Agent`. TLS uses the IDF cert bundle; the body is
+  never buffered whole, only streamed through a shared 2KB buffer.
+- **Heap stat (`/api/stat`)** - returns `{"free","min_free","largest_block"}` so
+  a page can watch RAM live.
+- **Display-off RAM reclaim** - the first HTTP request frees the ~63KB display
+  canvas and sleeps the panel, lifting the largest contiguous block from ~31KB to
+  ~63KB so TLS fits in the 512KB / no-PSRAM budget. The screen goes dark; press
+  the restart button to return to the menu (a clean boot restores the display).
 
 A **Temp Debug** item under `Settings` reports the raw temperature-sensor
 install / enable / read return codes - handy when bringing up new hardware.
+
+
+### LocalServe HTTP API
+
+Every served page talks to the firmware through these endpoints (all same-origin,
+so CORS never applies). `httpd` runs a single worker; handlers stream through a
+shared buffer and never buffer a whole file or response in RAM.
+
+| Method | URI | Body | Returns |
+|---|---|---|---|
+| GET | `/` | - | `index.html` (or built-in launcher if `/sites` is empty) |
+| GET | `/<path>` | - | static file / saved file; 404 if absent |
+| PUT / POST | `/api/save/<path>` | file bytes | writes `/sites/<path>` (temp + atomic rename) |
+| GET | `/api/fetch?url=&ref=&ua=` | - | raw upstream body (status + Content-Type mirrored) |
+| POST | `/api/fetch?url=&ref=&ua=` | relayed to upstream | raw upstream body |
+| GET | `/api/stat` | - | `{"free":N,"min_free":N,"largest_block":N}` |
+| GET | `/api/sniff.json` | - | live sniffer table (RAM) |
+
+**Proxy.** `url` must be absolute `http(s)://` (else 400 `bad url`). On POST the
+body and its `Content-Type` are relayed verbatim; `url`/`ref`/`ua` always stay in
+the query string. Upstream connect failure -> 502 `{"error":"upstream connect
+failed"}`. Timeout 15s. It is an open LAN relay (no host allowlist) - fine for a
+personal device; add an allowlist if ever exposed beyond the LAN.
+
+**Memory / store.** `/api/stat` is observability only; the reclaim is automatic
+(see Display-off, above). The SD card is mounted once and kept mounted (a few
+fixed KB, `max_files=4`); each file op is `fopen`/`fclose`, no handle is held
+between calls. The "store" is just files: write with `/api/save/<path>`, read
+back with plain `GET /<path>`. There is no key/value endpoint.
+
+Sample calls:
+
+```bash
+# read a saved JSON file, then write it back
+curl http://<ip>/data/library.json
+curl -X POST --data-binary @library.json http://<ip>/api/save/data/library.json
+# proxy a GET over TLS
+curl "http://<ip>/api/fetch?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fnikhilsaps%2FAtlas"
+# proxy a POST (relays body + Content-Type to the upstream)
+curl -X POST -H 'Content-Type: application/json' --data '{"query":"..."}' \
+  "http://<ip>/api/fetch?url=https%3A%2F%2Fapi.example.com%2Fgraphql"
+# heap stats
+curl http://<ip>/api/stat
+```
+
+```js
+// same-origin, from a page served off the card
+const stat = await (await fetch('/api/stat')).json();
+const text = await (await fetch('/api/fetch?url=' + encodeURIComponent(target))).text();
+const resp = await (await fetch('/api/fetch?url=' + encodeURIComponent(apiUrl), {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(payload),
+})).text();
+await fetch('/api/save/data/settings.json', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(settings),
+});
+```
 
 ---
 
