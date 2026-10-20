@@ -40,3 +40,5 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # Smaller printf + quieter logs
 CONFIG_NEWLIB_NANO_FORMAT=y
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+# QIO flash: 4-line reads, ~2x flash read bandwidth (WROOM-1 supports it)
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
