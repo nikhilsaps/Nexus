@@ -15,6 +15,8 @@
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include <ctype.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 static const char* TAG = "localserve";
 static volatile bool g_ls_served = false;  // set on first client request
@@ -511,6 +513,111 @@ static esp_err_t stat_handler(httpd_req_t* req) {
   return ESP_OK;
 }
 
+// GET /api/ls?path=/sub : list a directory under the web root as JSON:
+// {"path":"/sub","entries":[{"name":"x","size":123,"dir":false},...]}. Hidden
+// dotfiles and the reserved .nexus-* sidecars are omitted. Same path rules as
+// GET/save (no traversal); "/" lists the web root itself.
+static int ls_json_name(char* buf, int o, int cap, const char* name) {
+  for (const char* p = name; *p && o < cap - 8; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (c == '"' || c == '\\') { buf[o++] = '\\'; buf[o++] = (char)c; }
+    else if (c < 0x20)         { o += snprintf(buf + o, cap - o, "\\u%04x", c); }
+    else                        buf[o++] = (char)c;
+  }
+  return o;
+}
+static esp_err_t ls_handler(httpd_req_t* req) {
+  g_ls_served = true;
+  char rel[256] = "/";
+  size_t qlen = httpd_req_get_url_query_len(req) + 1;
+  if (qlen > 1 && qlen < 240) {
+    char* q = (char*)malloc(qlen);
+    if (q) {
+      httpd_req_get_url_query_str(req, q, qlen);
+      char val[200] = {0};
+      if (httpd_query_key_value(q, "path", val, sizeof val) == ESP_OK) {
+        ls_url_decode(val);
+        if (val[0]) strlcpy(rel, val, sizeof rel);
+      }
+      free(q);
+    }
+  }
+  if (strcmp(rel, "/") != 0 && !nx_sr_rel_path_ok(rel, sizeof(rel) - 1)) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad path"); return ESP_OK;
+  }
+  char dirpath[FSPATH_MAX];
+  if ((size_t)snprintf(dirpath, sizeof dirpath, SITES_ROOT "%s", rel) >= sizeof dirpath) {
+    httpd_resp_send_err(req, HTTPD_414_URI_TOO_LONG, "path too long"); return ESP_OK;
+  }
+  size_t dl = strlen(dirpath);
+  if (dl > sizeof(SITES_ROOT) && dirpath[dl - 1] == '/') dirpath[dl - 1] = 0;
+
+  DIR* d = opendir(dirpath);
+  if (!d) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such dir"); return ESP_OK; }
+
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  { char h[300]; int o = snprintf(h, sizeof h, "{\"path\":\"");
+    o = ls_json_name(h, o, (int)sizeof h, rel);
+    o += snprintf(h + o, sizeof h - o, "\",\"entries\":[");
+    httpd_resp_send_chunk(req, h, o); }
+
+  struct dirent* e;
+  bool first = true;
+  char full[FSPATH_MAX];
+  char line[400];
+  while ((e = readdir(d)) != NULL) {
+    if (e->d_name[0] == '.') continue;
+    if (nx_sr_is_sidecar(e->d_name)) continue;
+    long sz = 0; int isdir = 0;
+    if ((size_t)snprintf(full, sizeof full, "%s/%s", dirpath, e->d_name) < sizeof full) {
+      struct stat st;
+      if (stat(full, &st) == 0) { isdir = S_ISDIR(st.st_mode) ? 1 : 0; sz = (long)st.st_size; }
+    }
+    int o = snprintf(line, sizeof line, "%s{\"name\":\"", first ? "" : ",");
+    o = ls_json_name(line, o, (int)sizeof line, e->d_name);
+    o += snprintf(line + o, sizeof line - o, "\",\"size\":%ld,\"dir\":%s}",
+                  sz, isdir ? "true" : "false");
+    httpd_resp_send_chunk(req, line, o);
+    first = false;
+  }
+  closedir(d);
+  httpd_resp_send_chunk(req, "]}", 2);
+  httpd_resp_send_chunk(req, NULL, 0);
+  return ESP_OK;
+}
+
+// DELETE /api/save/<path> : remove one file under the web root. Same path rules
+// as save; refuses directories and anything that is not already a plain file.
+static esp_err_t delete_handler(httpd_req_t* req) {
+  g_ls_served = true;
+  char rel[URL_MAX];
+  const char* uri_rel = req->uri + strlen("/api/save");   // includes leading /
+  if (strlcpy(rel, uri_rel, sizeof rel) >= sizeof rel) {
+    httpd_resp_send_err(req, HTTPD_414_URI_TOO_LONG, "uri too long"); return ESP_OK;
+  }
+  { char* q = strchr(rel, '?'); if (q) *q = 0; }
+  if (!nx_sr_rel_path_ok(rel, sizeof(rel) - 1)) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad path"); return ESP_OK;
+  }
+  char dst[FSPATH_MAX];
+  if ((size_t)snprintf(dst, sizeof dst, SITES_ROOT "%s", rel) >= sizeof dst) {
+    httpd_resp_send_err(req, HTTPD_414_URI_TOO_LONG, "path too long"); return ESP_OK;
+  }
+  struct stat st;
+  if (stat(dst, &st) != 0) { send_status_json(req, "404 Not Found", "no such file"); return ESP_OK; }
+  if (S_ISDIR(st.st_mode)) { send_status_json(req, "409 Conflict", "is a directory"); return ESP_OK; }
+  if (remove(dst) != 0) {
+    ESP_LOGE(TAG, "delete %s failed: %s", rel, strerror(errno));
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "delete failed"); return ESP_OK;
+  }
+  ESP_LOGI(TAG, "deleted %s", rel);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, "{\"ok\":true}");
+  return ESP_OK;
+}
+
 bool ls_http_start(void) {
   if (g_srv) return true;
   bhid_release();   // reclaim NimBLE host+controller heap if a BLE module ran
@@ -519,7 +626,7 @@ bool ls_http_start(void) {
   hc.uri_match_fn          = httpd_uri_match_wildcard;
   hc.stack_size            = 10240;   // FATFS/SPI + heap path bufs need headroom
   hc.lru_purge_enable      = true;
-  hc.max_uri_handlers      = 8;
+  hc.max_uri_handlers      = 10;
   hc.recv_wait_timeout     = 10;
   hc.send_wait_timeout     = 10;
   if (httpd_start(&g_srv, &hc) != ESP_OK) { g_srv = 0; return false; }
@@ -531,11 +638,13 @@ bool ls_http_start(void) {
   httpd_uri_t fetch_p   = {}; fetch_p.uri   = "/api/fetch";     fetch_p.method   = HTTP_POST; fetch_p.handler   = fetch_handler;
   httpd_uri_t stat      = {}; stat.uri      = "/api/stat";      stat.method      = HTTP_GET;  stat.handler      = stat_handler;
   httpd_uri_t getall    = {}; getall.uri    = "/*";             getall.method    = HTTP_GET;  getall.handler    = get_handler;
+  httpd_uri_t ls_get    = {}; ls_get.uri    = "/api/ls";        ls_get.method    = HTTP_GET;    ls_get.handler    = ls_handler;
+  httpd_uri_t del       = {}; del.uri       = "/api/save/*";    del.method       = HTTP_DELETE; del.handler       = delete_handler;
 
   // The wildcard GET handler shadows everything, so a partially registered
   // server would silently serve 404s for /api/save instead of saving. Unwind
   // instead: a server that cannot route all four URIs must not come up.
-  const httpd_uri_t* uris[] = { &save_put, &save_post, &sniff, &fetch, &fetch_p, &stat, &getall };
+  const httpd_uri_t* uris[] = { &save_put, &save_post, &ls_get, &del, &sniff, &fetch, &fetch_p, &stat, &getall };
   for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
     esp_err_t e = httpd_register_uri_handler(g_srv, uris[i]);
     if (e != ESP_OK) {

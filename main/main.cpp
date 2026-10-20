@@ -27,6 +27,7 @@
 #include "beacon.h"
 #include "blespam.h"
 #include "karma.h"
+#include "ir_tx.h"
 
 // ---------- Palette (cyberdeck terminal) ----------
 static M5GFX display;
@@ -190,7 +191,7 @@ struct Menu {
 
 // ---------- App views ----------
 enum AppView { VIEW_MENU, VIEW_MSG, VIEW_KB, VIEW_MOUSE, VIEW_PAD, VIEW_FILES,
-                VIEW_FILEACT, VIEW_TEXTIN, VIEW_CONFIRM, VIEW_DUCK, VIEW_DUCKRUN, VIEW_WIFISCAN, VIEW_WIFISTAT, VIEW_HOTSPOT, VIEW_CAPPICK, VIEW_CAPTIVE, VIEW_SNIFF, VIEW_STAPICK, VIEW_DEAUTH, VIEW_BLESPAM, VIEW_BEACON, VIEW_KARMA };
+                VIEW_FILEACT, VIEW_TEXTIN, VIEW_CONFIRM, VIEW_DUCK, VIEW_DUCKRUN, VIEW_WIFISCAN, VIEW_WIFISTAT, VIEW_HOTSPOT, VIEW_CAPPICK, VIEW_CAPTIVE, VIEW_SNIFF, VIEW_STAPICK, VIEW_DEAUTH, VIEW_BLESPAM, VIEW_BEACON, VIEW_KARMA, VIEW_IR };
 static AppView g_view = VIEW_MENU;
 static Menu* g_anim_menu = NULL;
 static TickType_t g_anim_start = 0;
@@ -590,6 +591,52 @@ static void act_karma() {
   if (!karma_start()) { show_msg("KARMA", "Karma start\nfailed."); return; }
   g_view = VIEW_KARMA;
 }
+static int  g_ir_mode      = 0;   // 0 = blast sweep, 1 = find-my-tv
+static int  g_ir_find_cur  = 0;   // next code to send in find mode
+static int  g_ir_find_last = -1;  // last code actually sent (the one to save)
+static char g_ir_msg[48];
+
+static int ir_mytv_load() {
+  nvs_handle_t h; int32_t v = -1;
+  if (nvs_open("nexus", NVS_READONLY, &h) == ESP_OK) {
+    if (nvs_get_i32(h, "irtv", &v) != ESP_OK) v = -1;
+    nvs_close(h);
+  }
+  return (int)v;
+}
+static void ir_mytv_store(int idx) {
+  nvs_handle_t h;
+  if (nvs_open("nexus", NVS_READWRITE, &h) == ESP_OK) {
+    nvs_set_i32(h, "irtv", (int32_t)idx);
+    nvs_commit(h);
+    nvs_close(h);
+  }
+}
+
+static void act_ir_blast() {
+  if (!ir_blast_start()) { show_msg("IR", "IR start failed\n(RMT busy?)."); return; }
+  g_ir_mode = 0;
+  g_view = VIEW_IR;
+}
+static void act_ir_find() {
+  if (!ir_manual_begin()) { show_msg("IR", "IR start failed\n(RMT busy?)."); return; }
+  g_ir_mode = 1;
+  g_ir_find_cur = 0;
+  g_ir_find_last = -1;
+  g_view = VIEW_IR;
+}
+static void act_ir_mytv() {
+  int idx = ir_mytv_load();
+  if (idx < 0 || idx >= ir_count()) {
+    show_msg("My TV", "No saved code yet.\nUse Find My TV\nto set one.");
+    return;
+  }
+  if (!ir_manual_begin()) { show_msg("My TV", "IR busy."); return; }
+  ir_manual_send(idx);
+  ir_manual_end();
+  snprintf(g_ir_msg, sizeof(g_ir_msg), "Sent your saved\ncode (#%d).", idx);
+  show_msg("My TV", g_ir_msg);
+}
 
 // ---------- LocalServe actions ----------
 // Wireless: reuse the WiFi scan/connect flow, then start the file server on the
@@ -713,15 +760,24 @@ static MenuItem ls_items[] = {
 };
 static Menu localserve_menu = { "LOCALSERVE", ls_items, 3, 0, 0 };
 
+// IR: front emitter (GPIO44) via RMT. Self-contained, no radio.
+static MenuItem ir_items[] = {
+  { "Blast All Off", KIND_ACTION, 0, act_ir_blast, 0, 0 },
+  { "Find My TV",    KIND_ACTION, 0, act_ir_find,  0, 0 },
+  { "My TV",         KIND_ACTION, 0, act_ir_mytv,  0, 0 },
+};
+static Menu ir_menu = { "IR", ir_items, 3, 0, 0 };
+
 static MenuItem root_items[] = {
   { "BLE",      KIND_SUBMENU, &ble_menu,     0, 0, 0 },
   { "USB",      KIND_SUBMENU, &usb_menu,     0, 0, 0 },
   { "Storage",  KIND_SUBMENU, &storage_menu, 0, 0, 0 },
   { "WiFi",       KIND_SUBMENU, &wifi_menu,       0, 0, 0 },
   { "LocalServe", KIND_SUBMENU, &localserve_menu, 0, 0, 0 },
+  { "IR",         KIND_SUBMENU, &ir_menu,         0, 0, 0 },
   { "Settings",   KIND_SUBMENU, &set_menu,        0, 0, 0 },
 };
-static Menu root_menu = { "NEXUS", root_items, 6, 0, 0 };
+static Menu root_menu = { "NEXUS", root_items, 7, 0, 0 };
 
 // ---------- Layout ----------
 static const int LMARGIN = 12;                // shift past a damaged left column
@@ -1143,6 +1199,14 @@ static void sync_localserve() {
     g_sd_ok = false;
     g_serve_mode = false;
   }
+  was = now;
+}
+
+// IR uses only the RMT peripheral; release it when leaving the IR menu.
+static void sync_ir() {
+  static bool was = false;
+  bool now = stack_has(&ir_menu);
+  if (!now && was) { ir_blast_stop(); ir_manual_end(); }
   was = now;
 }
 
@@ -2437,6 +2501,80 @@ static void tick_beacon() {
   if (k == ',' || k == '`') { beacon_stop(); g_view = VIEW_MENU; g_last = k; }
 }
 
+static void draw_ir() {
+  canvas.fillSprite(C_BG);
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(textdatum_t::top_left);
+  int y = LIST_Y;
+  char l[80];
+  if (g_ir_mode == 0) {
+    draw_statusbar("IR Blast");
+    canvas.setTextColor(C_ACCENT, C_BG);
+    snprintf(l, sizeof(l), "blasting %d codes", ir_count());
+    canvas.drawString(l, 10, y);
+    canvas.setTextColor(C_TEXT, C_BG);
+    snprintf(l, sizeof(l), "sent  %u", (unsigned)ir_blast_sent());
+    canvas.drawString(l, 10, y + 24);
+    int n = ir_count();
+    int prog = n ? ((ir_blast_index() + 1) * 100 / n) : 0;
+    snprintf(l, sizeof(l), "code %d/%d  %d%%", ir_blast_index() + 1, n, prog);
+    canvas.setTextColor(C_DIM, C_BG);
+    canvas.drawString(l, 10, y + 48);
+    canvas.setTextColor(ir_blast_running() ? C_AMBER : C_DIM, C_BG);
+    canvas.drawString(ir_blast_running() ? "point at the TV..." : "stopped", 10, y + 66);
+    canvas.setTextDatum(textdatum_t::bottom_left);
+    canvas.setTextColor(C_DIM, C_BG);
+    canvas.drawString("d stop   , back", 8, H - 2);
+  } else {
+    draw_statusbar("Find My TV");
+    canvas.setTextColor(C_ACCENT, C_BG);
+    snprintf(l, sizeof(l), "code %d/%d  %dkHz", g_ir_find_cur + 1, ir_count(),
+             ir_code_freq(g_ir_find_cur) / 1000);
+    canvas.drawString(l, 10, y);
+    canvas.setTextColor(C_TEXT, C_BG);
+    canvas.drawString("tap / until TV reacts", 10, y + 24);
+    if (g_ir_find_last >= 0) {
+      snprintf(l, sizeof(l), "then ; saves #%d", g_ir_find_last);
+      canvas.setTextColor(C_AMBER, C_BG);
+      canvas.drawString(l, 10, y + 48);
+    } else {
+      canvas.setTextColor(C_DIM, C_BG);
+      canvas.drawString("(nothing sent yet)", 10, y + 48);
+    }
+    canvas.setTextDatum(textdatum_t::bottom_left);
+    canvas.setTextColor(C_DIM, C_BG);
+    canvas.drawString("/ send  ; save  , back", 8, H - 2);
+  }
+  canvas.pushSprite(LMARGIN, 0);
+}
+static void tick_ir() {
+  char k = kb_poll();
+  if (!k) return;
+  if (g_ir_mode == 0) {
+    if (k == 'd' || k == 'D') { ir_blast_stop(); g_ui_dirty = true; return; }
+    if (k == ',' || k == '`') { ir_blast_stop(); g_view = VIEW_MENU; g_last = k; }
+    return;
+  }
+  if (k == '/') {
+    g_ir_find_last = g_ir_find_cur;
+    ir_manual_send(g_ir_find_cur);
+    g_ir_find_cur = (g_ir_find_cur + 1) % ir_count();
+    g_ui_dirty = true;
+    return;
+  }
+  if (k == ';') {
+    if (g_ir_find_last >= 0) {
+      ir_mytv_store(g_ir_find_last);
+      snprintf(g_ir_msg, sizeof(g_ir_msg), "Saved code #%d\nas My TV.", g_ir_find_last);
+      ir_manual_end();
+      show_msg("My TV", g_ir_msg);
+      g_last = k;
+    }
+    return;
+  }
+  if (k == ',' || k == '`') { ir_manual_end(); g_view = VIEW_MENU; g_last = k; }
+}
+
 static void draw_karma() {
   canvas.fillSprite(C_BG);
   draw_statusbar("Karma ON");
@@ -2737,7 +2875,7 @@ extern "C" void app_main(void) {
          drawing_view == VIEW_SNIFF || drawing_view == VIEW_WIFISTAT ||
          drawing_view == VIEW_DEAUTH || drawing_view == VIEW_STAPICK ||
          drawing_view == VIEW_BLESPAM || drawing_view == VIEW_BEACON ||
-         drawing_view == VIEW_KARMA) &&
+         drawing_view == VIEW_KARMA || drawing_view == VIEW_IR) &&
         now - last_dynamic_draw >= pdMS_TO_TICKS(1000)) redraw = true;
     switch (g_view) {
       case VIEW_MENU: {
@@ -2759,6 +2897,7 @@ extern "C" void app_main(void) {
           sync_storage();
           sync_wifi();
           sync_localserve();
+          sync_ir();
         }
         if (g_anim_menu && (g_anim_menu != cur() || g_view != VIEW_MENU || !g_anim_on))
           g_anim_menu = NULL;
@@ -2799,6 +2938,7 @@ extern "C" void app_main(void) {
       case VIEW_BLESPAM: tick_blespam(); if (g_view == VIEW_BLESPAM && (redraw || g_ui_dirty)) draw_blespam(); break;
       case VIEW_BEACON: tick_beacon(); if (g_view == VIEW_BEACON && (redraw || g_ui_dirty)) draw_beacon(); break;
       case VIEW_KARMA: tick_karma(); if (g_view == VIEW_KARMA && (redraw || g_ui_dirty)) draw_karma(); break;
+      case VIEW_IR: tick_ir(); if (g_view == VIEW_IR && (redraw || g_ui_dirty)) draw_ir(); break;
       default: break;
     }
     if (redraw || g_ui_dirty) last_dynamic_draw = now;

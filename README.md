@@ -30,6 +30,7 @@ lwIP** for networking.
 | **Wi-Fi**     | Scan networks, join one and verify real internet, run a hotspot, host a captive / Evil-Twin portal (with optional login capture), or passively sniff nearby probes/clients. Plus a live signal meter and NTP clock sync. |
 | **RF attacks** | Wi-Fi **deauth** (broadcast or per-client, with associated-station discovery), **beacon** SSID spam, a **Karma** probe-response lure, and **BLE pairing-prompt spam** (Apple / Microsoft / Google). Own-gear / lab testing only. |
 | **LocalServe** | Host static sites straight off the SD card - over Wi-Fi or a plain USB-C cable (USB-NCM). The Cardputer becomes a tiny web host. |
+| **Infrared** | A universal TV-B-Gone-style IR remote: blast 202 built-in TV power codes to switch almost any television off (Blast), auto-find the one code that works (Find My TV), then save and re-send just that code (My TV). |
 
 Everything is **lazy and mutually exclusive**: a radio or the SD card is powered
 up only while you are inside its menu and fully torn down the moment you leave.
@@ -191,6 +192,20 @@ leave (`,` or `` ` ``).
   Fast Pair (or all three at once). It borrows the NimBLE host from BLE HID, so it
   is **mutually exclusive with `BLE > Control`**. Live advertisements-sent counter.
 
+### Infrared remote
+
+`IR` is a universal infrared remote built on a TV-B-Gone-style power-code set
+(202 codes: NEC / RC5 / Sony SIRC and raw timings).
+
+- **Blast** - transmits all 202 TV power codes in sequence, so pointing the
+  Cardputer at almost any television turns it off (or on). A live counter shows
+  how far through the set it is.
+- **Find My TV** - steps through the same set one code at a time so that, when a
+  TV finally reacts, you can save the single code that worked.
+- **My TV** - stores the code you found and re-sends just that one on demand.
+
+IR is **send-only** (it drives the Cardputer's IR LED; there is no capture).
+
 ### LocalServe
 
 `LocalServe` serves static sites straight off the SD card over your LAN, turning
@@ -201,7 +216,8 @@ cable.
   then Nexus starts an HTTP server and serves files from `/sites` on the SD
   card, showing the `http://<ip>/` to open. Content type is set by extension,
   large files stream in chunks, a pre-compressed `.gz` twin is preferred when
-  present, and `PUT`/`POST /api/save/<path>` writes a file (temp + rename). If
+  present, `PUT`/`POST /api/save/<path>` writes a file (temp + rename),
+  `DELETE /api/save/<path>` removes one, and `GET /api/ls` lists a directory. If
   `/sites` has no `index.html`, a built-in launcher page is shown.
 - **Wired (USB-NCM)** - the same server over a USB-C network link, no Wi-Fi or
   router needed. Nexus brings up a **USB-CDC-NCM** adapter (Windows 11 and Linux
@@ -237,6 +253,8 @@ shared buffer and never buffer a whole file or response in RAM.
 | GET | `/` | - | `index.html` (or built-in launcher if `/sites` is empty) |
 | GET | `/<path>` | - | static file / saved file; 404 if absent |
 | PUT / POST | `/api/save/<path>` | file bytes | writes `/sites/<path>` (temp + atomic rename) |
+| DELETE | `/api/save/<path>` | - | deletes `/sites/<path>` |
+| GET | `/api/ls?path=<dir>` | - | JSON directory listing (`{"path","entries":[{"name","size","dir"}]}`); `/` lists the web root |
 | GET | `/api/fetch?url=&ref=&ua=` | - | raw upstream body (status + Content-Type mirrored) |
 | POST | `/api/fetch?url=&ref=&ua=` | relayed to upstream | raw upstream body |
 | GET | `/api/stat` | - | `{"free":N,"min_free":N,"largest_block":N}` |
@@ -364,6 +382,7 @@ flowchart TD
     WIFI --> RF["deauther / beacon / karma (raw esp_wifi_80211_tx)"]
     BLE --> BSPAM["blespam (pairing-prompt advertisements)"]
     UI --> LS["localserve (HTTP server, serves /sites off SD)"]
+    UI --> IR["ir_tx (infrared TV-B-Gone power-code blaster)"]
     LS --> LSW["Wi-Fi link (reuses wifi_net STA)"]
     LS --> LSU["usb_net (USB-CDC-NCM + DHCP, 192.168.7.1)"]
     DUCK["Ducky engine"] --> HID
@@ -385,6 +404,8 @@ Nexus/
     wifi_net.cpp/.h     Wi-Fi: scan, connect, internet probe, hotspot,
                         captive portal (HTTP + DNS), NTP
     localserve.cpp/.h   SD-hosted static web server (/sites over the LAN)
+    ir_tx.cpp/.h        infrared transmitter (TV-B-Gone-style power-code blaster)
+    ir_codes.h          built-in IR power-code table (202 codes)
     usb_net.cpp/.h      USB-CDC-NCM adapter + esp_netif gateway + DHCP (Wired)
     sniffer.cpp/.h      promiscuous Wi-Fi sniffer + probe/client logger (RAM)
     deauther.cpp/.h     802.11 deauth/disassoc TX + associated-station discovery

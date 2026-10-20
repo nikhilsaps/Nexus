@@ -1,9 +1,9 @@
 # Nexus - Development Log
 
 A running record of what is built and how, so work can resume cleanly.
-Last updated: 2026-10-15.
+Last updated: 2026-10-20.
 
-## Status: core baseline verified; optimization regression checks in progress
+## Status: full toolkit built + flashed; offensive RF suite and LocalServe HTTPS proxy on device
 
 | Feature | State |
 |---------|-------|
@@ -21,6 +21,19 @@ Last updated: 2026-10-15.
 | LocalServe: Wireless (SD-hosted static sites over Wi-Fi) | done, verified |
 | LocalServe: Wired (SD-hosted static sites over USB-CDC-NCM) | done, verified |
 | Wi-Fi Sniffer (promiscuous probe/client logger, served as live JSON over NCM) | done, built |
+| Wi-Fi: Deauth (per-client + broadcast, associated-station discovery) | done, flashed (ca4322a) |
+| Wi-Fi: Beacon spam (fake SSIDs, rotating ch 1/6/11) | done, flashed (ca4322a) |
+| Wi-Fi: Karma (probe-response lure, harvest + respond) | done, flashed (ca4322a) |
+| BLE: BLE Spam (Apple/Microsoft/Google pairing-prompt ads) | done, flashed (ca4322a) |
+| Wi-Fi: Evil-Twin login capture (POSTed creds -> /sites/captive/creds.log) | done, flashed (ca4322a) |
+| LocalServe: HTTPS proxy (`/api/fetch` GET+POST, CORS-free) | done, flashed (a4e8677) |
+| LocalServe: display-off RAM reclaim (frees ~63KB canvas so TLS fits) | done, flashed (a4e8677) |
+| LocalServe: heap stat endpoint (`/api/stat`) | done, flashed (a4e8677) |
+| Flash: DIO -> QIO mode (~2x flash read bandwidth) | done, flashed (451aa6b) |
+
+> Lab / own-gear use only for the RF offensive modes (Deauth / Beacon / Karma /
+> BLE Spam / Evil-Twin). They transmit; use only on hardware you own or are
+> authorized to test.
 
 ## Design principles (do not break these)
 
@@ -52,8 +65,18 @@ Last updated: 2026-10-15.
 - `localserve.cpp` - esp_http_server that serves static files from `/sites` on
   the SD card: content type by extension, chunked fopen streaming for big files,
   `.gz`-twin preference, a built-in launcher when `/sites` has no `index.html`,
-  and `PUT`/`POST /api/save/<path>` (temp file + rename). Reuses the Wi-Fi
+  and `PUT`/`POST /api/save/<path>` (temp file + rename). Also hosts the HTTPS
+  proxy `/api/fetch` (GET+POST, CORS-free pass-through via esp_http_client + IDF
+  cert bundle), `/api/stat` heap JSON, and the display-off RAM reclaim that frees
+  the ~63KB canvas on the first request so a TLS handshake fits. Reuses the Wi-Fi
   scan/connect flow to get on the LAN; mutually exclusive like the other radios.
+- `deauther.cpp` - 802.11 deauth/disassoc raw TX (`esp_wifi_80211_tx` with a
+  frame-sanity override + `--allow-multiple-definition`) plus associated-station
+  discovery. `beacon.cpp` - beacon-spam transmitter (fake SSIDs, rotating ch
+  1/6/11). `karma.cpp` - probe-response lure (harvest directed probes, respond).
+  `blespam.cpp` - BLE pairing-prompt ad spam (Apple/Microsoft/Google), borrows
+  the NimBLE host so it is mutually exclusive with BLE HID. All lab / own-gear
+  use only.
 - `usb_net.cpp` - the Wired transport for LocalServe. Brings up a USB-CDC-NCM
   device via esp_tinyusb (`CONFIG_TINYUSB_NET_MODE_NCM`), wired to an
   `esp_netif` configured as a static gateway at 192.168.7.1/24 with a DHCP
@@ -66,10 +89,10 @@ Last updated: 2026-10-15.
 
 ```
 NEXUS (root)
-  BLE       -> Control (Keyboard/Mouse/Gamepad), Duck, Forget Bonds, Info
+  BLE       -> Control (Keyboard/Mouse/Gamepad), Duck, BLE Spam, Forget Bonds, Info
   USB       -> Control (Keyboard/Mouse/Gamepad), Duck
   Storage   -> Browse, Card Info, Refresh
-  WiFi      -> Scan, Hotspot, Evil-Twin, Free Heap
+  WiFi      -> Scan, Hotspot, Evil-Twin, Deauth, Beacon, Karma, Free Heap
   LocalServe-> Wireless (WiFi), Wired (USB-NCM), Sniffer (NCM)
   Settings  -> Logging, Animation, Temp Bar (on/off),
                Temp Rate (2/5/10/30/60 s), Temp Debug, About
@@ -133,14 +156,15 @@ esp_driver_sdspi, esp_wifi, esp_netif, lwip, esp_http_server.
 ## Ideas / not yet built
 
 - LAN host scanner (ping-sweep the subnet once connected).
-- Captive portal with form capture / multiple pages / asset serving.
 - A dedicated full-screen signal-meter view (currently folded into the connect
   status screen).
 - Optional second ESP32-C3 as an ESP-AT Wi-Fi co-processor over UART, to allow
   simultaneous Wi-Fi + BLE/USB (would lift the mutual-exclusivity limit).
-- "Lab only" offensive Wi-Fi modes: deauth and beacon spam still deferred.
-  Evil-Twin (SSID-clone captive) and the passive packet sniffer are now built;
-  use only on networks/devices you own or are authorized to test.
+
+(Shipped since first listed here: the offensive Wi-Fi modes - Deauth, Beacon and
+Karma - and BLE Spam are now built and flashed; the Evil-Twin captive portal
+gained login/form capture to `/sites/captive/creds.log`. See the dated sections
+below.)
 
 ## Wi-Fi Sniffer notes (2026-10-13)
 
@@ -194,3 +218,53 @@ esp_driver_sdspi, esp_wifi, esp_netif, lwip, esp_http_server.
   build/pre-optimization-device-app.bin.
 - Interactive UI, HID, SD HTTP saves and optional DFS behavior not verified on
   hardware in this pass. No measured battery/latency claims.
+
+## 2026-10-17 - Offensive RF suite + Evil-Twin login capture (ca4322a)
+
+- Added four active-radio tools (lab / own-gear only). All obey the lazy teardown
+  rule: the tool transmits only while its screen is on the nav stack, stops on `,`
+  or `` ` ``.
+- `deauther.cpp` (Wi-Fi > Deauth): pick an AP from a scan, passively discover its
+  associated stations (vendor-labelled, RSSI + packet counts), then `d` to deauth
+  a selected client or broadcast `FF:FF:...` to knock all clients off, radio parked
+  on the AP channel. Raw deauth/disassoc frames via `esp_wifi_80211_tx`; a
+  program-wide `ieee80211_raw_frame_sanity_check()` override plus the linker
+  `--allow-multiple-definition` flag in `main/CMakeLists.txt` get them past the IDF
+  frame filter. Live frames-sent counter.
+- `beacon.cpp` (Wi-Fi > Beacon): floods beacon frames for a built-in fake-SSID list,
+  rotating ch 1/6/11; each SSID keeps a stable locally-administered BSSID. Live
+  beacon count + channel.
+- `karma.cpp` (Wi-Fi > Karma): listens for directed probe requests, harvests the
+  SSIDs phones are hunting for, and floods beacons + probe responses for each. Live
+  harvested-SSID and frames-sent counts.
+- `blespam.cpp` (BLE > BLE Spam): rapid fake pairing/proximity ads with a fresh
+  random address per burst - Apple proximity-pair, Windows Swift Pair, Android Fast
+  Pair (or all three). Borrows the NimBLE host, so mutually exclusive with BLE
+  Control. Live advertisements-sent counter.
+- Evil-Twin gained login/form capture: any login form POSTed by a joined client is
+  written to `/sites/captive/creds.log` with a running saved-count on screen. `g`
+  on the page picker drops three built-in phishing templates onto the card.
+- Built + flashed to COM3. Lab / own-gear / authorized-test use only.
+
+## 2026-10-19 - LocalServe HTTPS proxy + RAM reclaim + API docs (a4e8677)
+
+- `/api/fetch` HTTPS proxy added to `localserve.cpp` (GET + POST wired to one
+  handler): a dumb CORS-free pass-through via `esp_http_client` + the IDF cert
+  bundle, streamed through a single reused 2KB buffer, never buffering the whole
+  body. `url`/`ref`/`ua` in the query string; POST relays body + Content-Type to
+  the upstream. 15s timeout; upstream connect failure -> 502. Open LAN relay, no
+  host allowlist (fine for a personal device).
+- Display-off RAM reclaim: the first HTTP request frees the ~63KB display canvas
+  and sleeps the panel, lifting the largest contiguous block from ~31KB to ~63KB
+  so a TLS handshake fits in the 512KB/no-PSRAM budget. Screen goes dark by design;
+  restart to return to the menu.
+- `/api/stat` returns `{free, min_free, largest_block}` for live heap watching.
+- API docs published in the companion Nexus-Extras repo: LOCALSERVE-API-GUIDE.md
+  (LAN serving + proxy + save + stat) and CAPTIVE-PORTAL-API-GUIDE.md (isolated
+  Evil-Twin store). These are the contract any served web app (Atlas, Akashic)
+  builds against.
+
+## 2026-10-20 - Flash read speed (451aa6b)
+
+- Switched flash from DIO to QIO mode for ~2x flash read bandwidth on the
+  ESP32-S3; the bootloader upgrades itself at boot.
