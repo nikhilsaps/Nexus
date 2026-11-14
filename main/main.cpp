@@ -327,11 +327,14 @@ static char        g_wifi_stat[192];
 static char        g_wifi_ssel[WIFI_SSID_MAX];
 static uint8_t     g_wifi_auth = 0;
 static char        g_wifi_pass[64];
+static bool        g_wifi_from_saved = false; // this attempt used a stored password
 static char        g_ap_ssid[WIFI_SSID_MAX];
 static char        g_ap_pass[64];
 static bool        g_wifi_connected = false;
 static int         g_wifi_inet = -1;   // -1 unknown, 0 no, 1 yes
 static bool        g_serve_mode = false;  // true = this WiFi session is a LocalServe host
+static bool        g_gateway_mode = false; // true = share WiFi to the USB-NCM host (NAPT)
+static bool        g_remote_mode = false;  // true = WiFi web UI drives USB HID (phone -> PC)
 static bool        g_display_off = false; // true = display freed+asleep for LocalServe RAM
 static bool        g_evil_mode  = false;  // true = scan pick clones SSID into the open AP (Evil-Twin)
 static bool        g_deauth_mode = false; // true = scan pick becomes the deauth target
@@ -426,6 +429,73 @@ static void nvs_save() {
     nvs_close(h);
   }
 }
+
+// ---------- Saved WiFi credentials (NVS blob) ----------
+// SSIDs can be 32 chars but NVS keys max out at 15, so all credentials live in
+// one blob under namespace "wificreds". Most-recently-saved networks are kept;
+// the oldest is evicted past WIFI_CRED_MAX. A stored password that fails to
+// connect is auto-forgotten (see do_wifi_connect) so a changed key re-prompts.
+#define WIFI_CRED_MAX 16
+struct WifiCred { char ssid[WIFI_SSID_MAX]; char pass[64]; };
+static WifiCred s_cred_scratch[WIFI_CRED_MAX];  // UI task is single-threaded
+
+static int wifi_cred_load_all(void) {
+  nvs_handle_t h; int n = 0;
+  if (nvs_open("wificreds", NVS_READONLY, &h) == ESP_OK) {
+    size_t sz = 0;
+    if (nvs_get_blob(h, "list", NULL, &sz) == ESP_OK && sz >= sizeof(WifiCred)) {
+      int cnt = (int)(sz / sizeof(WifiCred));
+      if (cnt > WIFI_CRED_MAX) cnt = WIFI_CRED_MAX;
+      size_t rsz = (size_t)cnt * sizeof(WifiCred);
+      if (nvs_get_blob(h, "list", s_cred_scratch, &rsz) == ESP_OK) n = cnt;
+    }
+    nvs_close(h);
+  }
+  return n;
+}
+static void wifi_cred_store_all(int n) {
+  nvs_handle_t h;
+  if (nvs_open("wificreds", NVS_READWRITE, &h) == ESP_OK) {
+    if (n <= 0) nvs_erase_key(h, "list");
+    else nvs_set_blob(h, "list", s_cred_scratch, (size_t)n * sizeof(WifiCred));
+    nvs_commit(h);
+    nvs_close(h);
+  }
+}
+static bool wifi_cred_get(const char* ssid, char* pass, int cap) {
+  int n = wifi_cred_load_all();
+  for (int i = 0; i < n; i++) {
+    if (strcmp(s_cred_scratch[i].ssid, ssid) == 0) {
+      strncpy(pass, s_cred_scratch[i].pass, cap - 1); pass[cap - 1] = 0;
+      return true;
+    }
+  }
+  return false;
+}
+static void wifi_cred_save(const char* ssid, const char* pass) {
+  if (!ssid[0] || !pass[0]) return;          // only secured networks we joined
+  int n = wifi_cred_load_all();
+  int idx = -1;
+  for (int i = 0; i < n; i++) if (strcmp(s_cred_scratch[i].ssid, ssid) == 0) { idx = i; break; }
+  if (idx < 0) {
+    if (n < WIFI_CRED_MAX) { idx = n++; }
+    else { memmove(&s_cred_scratch[0], &s_cred_scratch[1], (WIFI_CRED_MAX - 1) * sizeof(WifiCred)); idx = WIFI_CRED_MAX - 1; }
+  }
+  strncpy(s_cred_scratch[idx].ssid, ssid, sizeof(s_cred_scratch[idx].ssid) - 1);
+  s_cred_scratch[idx].ssid[sizeof(s_cred_scratch[idx].ssid) - 1] = 0;
+  strncpy(s_cred_scratch[idx].pass, pass, sizeof(s_cred_scratch[idx].pass) - 1);
+  s_cred_scratch[idx].pass[sizeof(s_cred_scratch[idx].pass) - 1] = 0;
+  wifi_cred_store_all(n);
+}
+static void wifi_cred_forget(const char* ssid) {
+  int n = wifi_cred_load_all();
+  int idx = -1;
+  for (int i = 0; i < n; i++) if (strcmp(s_cred_scratch[i].ssid, ssid) == 0) { idx = i; break; }
+  if (idx < 0) return;
+  for (int i = idx; i < n - 1; i++) s_cred_scratch[i] = s_cred_scratch[i + 1];
+  wifi_cred_store_all(n - 1);
+}
+static void wifi_cred_forget_all(void) { wifi_cred_store_all(0); }
 static void on_log_toggle(bool v)  { apply_log(); nvs_save(); }
 static void on_anim_toggle(bool v) { nvs_save(); }
 static void on_power_toggle(bool v) {
@@ -658,6 +728,19 @@ static void act_ls_wireless() {
   g_view = VIEW_WIFISCAN;
   wifi_scan_now();
 }
+static void act_ls_remote() {
+  if (sniffer_running()) { show_msg("REMOTE HID", "Leave LocalServe first\nto switch radio mode."); return; }
+  if (!g_sd_ok) { show_msg("REMOTE HID", "No SD card.\nNeed /sites/remote/."); return; }
+  if (!ls_prepare_wifi()) {
+    show_msg("REMOTE HID", "WiFi not ready.\nLeave and re-enter\nLocalServe.");
+    return;
+  }
+  g_serve_mode  = false;
+  g_remote_mode = true;
+  g_evil_mode   = false;
+  g_view = VIEW_WIFISCAN;
+  wifi_scan_now();
+}
 static void act_ls_wired() {
   if (!g_sd_ok) {
     show_msg("LOCALSERVE", "No SD card.\nNeed /sdcard/sites.");
@@ -688,6 +771,20 @@ static void act_ls_sniffer() {
   g_view = VIEW_SNIFF;
 }
 
+// Gateway: share the WiFi uplink to a PC over the USB-NCM adapter. Join WiFi
+// (STA) via the usual scan/connect flow (g_gateway_mode routes do_wifi_connect
+// to bring up NCM + NAPT once associated), so the host plugged into USB gets
+// real internet through 192.168.7.1.
+static void act_ls_gateway() {
+  if (sniffer_running()) { show_msg("GATEWAY", "Leave LocalServe first\nto switch radio mode."); return; }
+  if (!ls_prepare_wifi()) { show_msg("GATEWAY", "WiFi not ready.\nLeave and re-enter\nLocalServe."); return; }
+  g_serve_mode   = false;
+  g_gateway_mode = true;
+  g_evil_mode    = false;
+  g_view = VIEW_WIFISCAN;
+  wifi_scan_now();
+}
+
 // ---------- Menu tree ----------
 static MenuItem control_items[] = {
   { "Keyboard", KIND_ACTION, 0, act_ble_kb, 0, 0 },
@@ -705,6 +802,10 @@ static MenuItem ble_items[] = {
 };
 static Menu ble_menu = { "BLE", ble_items, 5, 0, 0 };
 
+static void act_forget_wifi() {
+  wifi_cred_forget_all();
+  show_msg("WIFI", "Saved WiFi networks\ncleared. You will be\nasked for passwords\nagain.");
+}
 static MenuItem set_items[] = {
   { "Logging",   KIND_TOGGLE, 0, 0, &g_log_on,  on_log_toggle },
   { "Animation", KIND_TOGGLE, 0, 0, &g_anim_on, on_anim_toggle },
@@ -713,9 +814,10 @@ static MenuItem set_items[] = {
   { "Temp Debug",KIND_ACTION, 0, act_temp_debug, 0, 0 },
   { "Memory",    KIND_ACTION, 0, act_memory_info, 0, 0 },
   { "Power Save",KIND_TOGGLE, 0, 0, &g_power_save, on_power_toggle },
+  { "Forget WiFi",KIND_ACTION, 0, act_forget_wifi, 0, 0 },
   { "About",     KIND_ACTION, 0, act_about, 0, 0 },
 };
-static Menu set_menu = { "SETTINGS", set_items, 8, 0, 0 };
+static Menu set_menu = { "SETTINGS", set_items, 9, 0, 0 };
 
 // USB mirrors BLE: USB > Control > Keyboard / Mouse / Gamepad (native USB HID).
 static MenuItem usb_control_items[] = {
@@ -757,8 +859,10 @@ static MenuItem ls_items[] = {
   { "Wireless (WiFi)", KIND_ACTION, 0, act_ls_wireless, 0, 0 },
   { "Wired (USB-NCM)", KIND_ACTION, 0, act_ls_wired,    0, 0 },
   { "Sniffer (NCM)",   KIND_ACTION, 0, act_ls_sniffer,  0, 0 },
+  { "Gateway USB->WiFi", KIND_ACTION, 0, act_ls_gateway, 0, 0 },
+  { "Remote (HID)",    KIND_ACTION, 0, act_ls_remote,  0, 0 },
 };
-static Menu localserve_menu = { "LOCALSERVE", ls_items, 3, 0, 0 };
+static Menu localserve_menu = { "LOCALSERVE", ls_items, 5, 0, 0 };
 
 // IR: front emitter (GPIO44) via RMT. Self-contained, no radio.
 static MenuItem ir_items[] = {
@@ -1192,12 +1296,15 @@ static void sync_localserve() {
     sniffer_stop();
     ls_http_stop();
     usb_net_stop();
+    uhid_stop();                 // Remote (HID) mode may have started USB HID.
     if (g_aps) { free(g_aps); g_aps = 0; }
     wifi_net_stop();
     g_ap_count = 0;
     sd_unmount();
     g_sd_ok = false;
     g_serve_mode = false;
+    g_gateway_mode = false;
+    g_remote_mode = false;
   }
   was = now;
 }
@@ -1573,7 +1680,9 @@ static void do_wifi_connect(const char* ssid, const char* pass) {
   canvas.pushSprite(LMARGIN, 0);
   g_wifi_connected = (wifi_net_connect(ssid, pass, 12000) == 1);
   g_wifi_inet = -1;
-  if (g_wifi_connected && !g_serve_mode) {
+  if (g_wifi_connected) { if (pass && pass[0]) wifi_cred_save(ssid, pass); }
+  else if (g_wifi_from_saved) { wifi_cred_forget(ssid); }
+  if (g_wifi_connected && !g_serve_mode && !g_gateway_mode && !g_remote_mode) {
     canvas.fillSprite(C_BG);
     draw_statusbar("WiFi");
     canvas.setTextDatum(textdatum_t::middle_center);
@@ -1581,6 +1690,23 @@ static void do_wifi_connect(const char* ssid, const char* pass) {
     canvas.drawString("Checking internet...", W / 2, H / 2);
     canvas.pushSprite(LMARGIN, 0);
     g_wifi_inet = wifi_net_check_internet();
+  }
+  if (g_wifi_connected && g_gateway_mode) {
+    char ip[20] = "?", gw[20];
+    wifi_net_sta_ipinfo(ip, gw, sizeof(ip));
+    uhid_stop();                       // gateway needs the USB-OTG PHY
+    bool ncm = usb_net_start();
+    bool nat = ncm && usb_net_gateway_enable();
+    if (nat) {
+      snprintf(g_wifi_stat, sizeof(g_wifi_stat),
+        "Internet shared!\nWiFi: %s\nUplink IP: %s\n\nPlug USB into a PC;\nit goes online via\n192.168.7.1", ssid, ip);
+    } else {
+      snprintf(g_wifi_stat, sizeof(g_wifi_stat),
+        "Gateway FAILED.\n%s", ncm ? usb_net_last_err() : "USB-NCM did not start");
+    }
+    g_gateway_mode = false;
+    show_msg("GATEWAY", g_wifi_stat);
+    return;
   }
   if (g_wifi_connected && g_serve_mode) {
     char ip[20] = "?", gw[20];
@@ -1591,6 +1717,18 @@ static void do_wifi_connect(const char* ssid, const char* pass) {
          : "Server start FAILED.\nCard not mounted?\n(%s)", ip);
     g_serve_mode = false;
     show_msg("LOCALSERVE", g_wifi_stat);
+    return;
+  }
+  if (g_wifi_connected && g_remote_mode) {
+    char ip[20] = "?", gw[20];
+    wifi_net_sta_ipinfo(ip, gw, sizeof(ip));
+    uhid_start("Nexus");             // USB HID output to the connected PC
+    bool up = ls_http_start();       // WiFi web UI that drives the HID
+    snprintf(g_wifi_stat, sizeof(g_wifi_stat),
+      up ? "HID Remote ready!\nOn your phone open\nhttp://%s/remote/\n\nScreen sleeps once\na client connects;\nrestart to exit."
+         : "Server start FAILED.\nCard not mounted?\n(%s)", ip);
+    g_remote_mode = false;
+    show_msg("REMOTE HID", g_wifi_stat);
     return;
   }
   g_view = VIEW_WIFISTAT;
@@ -1612,6 +1750,7 @@ static void commit_wifi_text() {
   if (g_tin_mode == TIN_WIFIPASS) {
     strncpy(g_wifi_pass, g_tin, sizeof(g_wifi_pass) - 1);
     g_wifi_pass[sizeof(g_wifi_pass) - 1] = 0;
+    g_wifi_from_saved = false;
     do_wifi_connect(g_wifi_ssel, g_wifi_pass);
   } else if (g_tin_mode == TIN_APSSID) {
     if (!g_tin[0]) { show_msg("HOTSPOT", "Name cannot\nbe empty."); return; }
@@ -2153,7 +2292,8 @@ static void tick_wifiscan() {
       strncpy(g_wifi_ssel, a->ssid, sizeof(g_wifi_ssel) - 1);
       g_wifi_ssel[sizeof(g_wifi_ssel) - 1] = 0;
       g_wifi_auth = a->authmode;
-      if (a->authmode == 0) { g_wifi_pass[0] = 0; do_wifi_connect(g_wifi_ssel, g_wifi_pass); }
+      if (a->authmode == 0) { g_wifi_pass[0] = 0; g_wifi_from_saved = false; do_wifi_connect(g_wifi_ssel, g_wifi_pass); }
+      else if (wifi_cred_get(g_wifi_ssel, g_wifi_pass, sizeof(g_wifi_pass))) { g_wifi_from_saved = true; do_wifi_connect(g_wifi_ssel, g_wifi_pass); }
       else begin_text(TIN_WIFIPASS, "");
       break;
     }

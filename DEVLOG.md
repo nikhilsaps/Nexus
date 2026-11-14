@@ -93,7 +93,8 @@ NEXUS (root)
   USB       -> Control (Keyboard/Mouse/Gamepad), Duck
   Storage   -> Browse, Card Info, Refresh
   WiFi      -> Scan, Hotspot, Evil-Twin, Deauth, Beacon, Karma, Free Heap
-  LocalServe-> Wireless (WiFi), Wired (USB-NCM), Sniffer (NCM)
+  LocalServe-> Wireless (WiFi), Wired (USB-NCM), Sniffer (NCM),
+               Gateway USB->WiFi, Remote (HID)
   Settings  -> Logging, Animation, Temp Bar (on/off),
                Temp Rate (2/5/10/30/60 s), Temp Debug, About
 ```
@@ -268,3 +269,22 @@ below.)
 
 - Switched flash from DIO to QIO mode for ~2x flash read bandwidth on the
   ESP32-S3; the bootloader upgrades itself at boot.
+
+## 2026-11-14 - Remote (HID): phone web UI drives USB HID
+
+- New LocalServe mode "Remote (HID)" (`act_ls_remote`, `g_remote_mode`). Joins
+  WiFi as STA and brings up USB HID + the HTTP server at once - the same
+  WiFi-STA + USB coexistence the NCM gateway already relies on. A phone on the
+  same LAN opens `http://<ip>/remote/`; the web page (Nexus-Extras
+  `sites/remote/index.html`) sends same-origin GETs that the firmware turns into
+  real USB keyboard/mouse/gamepad reports on the connected PC.
+- `localserve.cpp`: `ascii_to_hid()` (US layout) + four handlers
+  `/api/hid/type|key|mouse|pad`, registered ahead of the wildcard GET;
+  `max_uri_handlers` raised 10 -> 16. Each handler 503s if USB HID is not up.
+- `main.cpp`: `do_wifi_connect` gains a `g_remote_mode` branch (uhid_start +
+  ls_http_start, skips the internet probe); `sync_localserve` teardown now also
+  `uhid_stop()`s and clears the flag.
+- Built clean (nexus.bin 0x164110, 54% app free) and flashed to COM3. The
+  display sleeps once a client connects (universal LocalServe RAM reclaim), so
+  exit is a physical restart like the other serve modes. On-device keystroke
+  test pending Nikhil.

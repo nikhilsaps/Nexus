@@ -30,6 +30,7 @@ lwIP** for networking.
 | **Wi-Fi**     | Scan networks, join one and verify real internet, run a hotspot, host a captive / Evil-Twin portal (with optional login capture), or passively sniff nearby probes/clients. Plus a live signal meter and NTP clock sync. |
 | **RF attacks** | Wi-Fi **deauth** (broadcast or per-client, with associated-station discovery), **beacon** SSID spam, a **Karma** probe-response lure, and **BLE pairing-prompt spam** (Apple / Microsoft / Google). Own-gear / lab testing only. |
 | **LocalServe** | Host static sites straight off the SD card - over Wi-Fi or a plain USB-C cable (USB-NCM). The Cardputer becomes a tiny web host. |
+| **Remote (HID)** | Open a web page from your phone and drive a USB-connected PC with it: live keystrokes, a trackpad (move / click / scroll), and a gamepad. The phone is the UI over Wi-Fi; the Cardputer is the keyboard/mouse/gamepad over USB. |
 | **Infrared** | A universal TV-B-Gone-style IR remote: blast 202 built-in TV power codes to switch almost any television off (Blast), auto-find the one code that works (Find My TV), then save and re-send just that code (My TV). |
 
 Everything is **lazy and mutually exclusive**: a radio or the SD card is powered
@@ -259,6 +260,10 @@ shared buffer and never buffer a whole file or response in RAM.
 | POST | `/api/fetch?url=&ref=&ua=` | relayed to upstream | raw upstream body |
 | GET | `/api/stat` | - | `{"free":N,"min_free":N,"largest_block":N}` |
 | GET | `/api/sniff.json` | - | live sniffer table (RAM) |
+| GET | `/api/hid/type?t=<text>` | - | type a US-layout ASCII string on the USB host |
+| GET | `/api/hid/key?name=<k>` or `?code=<usage>&mod=<bits>` | - | tap one key / chord (named: enter, esc, tab, bksp, del, arrows, home, end, pgup, pgdn) |
+| GET | `/api/hid/mouse?dx=&dy=&b=&w=` | - | relative move / button bitmap (1 L, 2 R, 4 M) / wheel |
+| GET | `/api/hid/pad?b=&x=&y=` | - | gamepad 16-button bitmap + two axes (-127..127) |
 
 **Proxy.** `url` must be absolute `http(s)://` (else 400 `bad url`). On POST the
 body and its `Content-Type` are relayed verbatim; `url`/`ref`/`ua` always stay in
@@ -302,6 +307,36 @@ await fetch('/api/save/data/settings.json', {
   body: JSON.stringify(settings),
 });
 ```
+
+### Remote (HID): phone as the PC's keyboard, mouse and gamepad
+
+`LocalServe -> Remote (HID)` joins Wi-Fi as a client (STA) and, at the same
+time, brings the USB-C port up as a composite HID device plugged into a
+computer. Wi-Fi and USB are separate hardware, so they run together (the same
+coexistence the USB-NCM gateway relies on).
+
+- Join your Wi-Fi from the on-screen scan; the device shows `http://<ip>/remote/`.
+- On a phone (or any browser) on the **same network**, open that URL. The page
+  is served off the SD card (`/sites/remote/`), so it is editable without
+  reflashing.
+- Whatever you do on the phone is relayed over USB to the PC in real time:
+  - **Keyboard** - tap the field and type; every key (and Ctrl/Alt/Win combos,
+    arrows, Enter, Tab, Esc) is sent live. Buttons for common chords
+    (Ctrl+C / Ctrl+V / Alt+Tab / Alt+F4 / Win).
+  - **Mouse** - a trackpad area for cursor movement, tap to left-click, plus
+    L / M / R buttons and scroll.
+  - **Gamepad** - a D-pad (two axes) and four face buttons; the PC sees a
+    generic HID gamepad.
+
+The firmware exposes these as same-origin `GET`s that it turns into real HID
+reports: `/api/hid/type`, `/api/hid/key`, `/api/hid/mouse`, `/api/hid/pad`
+(see the API table above). Each returns `{"ok":true}` and answers `503` if USB
+HID is not currently up. The keyboard assumes a US layout.
+
+Like the other serving modes, the display sleeps once a client connects (the
+RAM reclaim), so the Cardputer screen goes dark while you drive the PC from your
+phone; a physical restart returns to the menu. The phone web page lives in the
+companion **Nexus-Extras** repo at `sites/remote/index.html`.
 
 ---
 

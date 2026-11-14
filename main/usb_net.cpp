@@ -70,6 +70,7 @@ static const char* s_net_str[] = {
 static const char* TAG = "usbnet";
 static esp_netif_t* s_netif = NULL;
 static bool s_up = false;
+static bool s_napt = false;
 static char s_err[96] = "";
 
 const char* usb_net_last_err(void) { return s_err; }
@@ -190,8 +191,43 @@ bool usb_net_start(void) {
     return true;
 }
 
+// Turn this NCM adapter into an internet gateway: SNAT the USB host's traffic
+// out over the WiFi-STA uplink and hand the host a usable DNS. lwip keys NAPT on
+// the interface a packet ENTERS (ip_napt_forward: `if (!inp->napt) return`) and
+// rewrites the source to the output interface's IP, so NAPT is enabled on THIS
+// (USB/private) netif, not on the STA. The default route (higher route_prio STA)
+// carries the forwarded, source-rewritten packets to the real network.
+bool usb_net_gateway_enable(void) {
+    if (!s_up || !s_netif) { snprintf(s_err, sizeof(s_err), "gw: usb-net down"); return false; }
+    esp_netif_t* sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta) { snprintf(s_err, sizeof(s_err), "gw: no STA netif"); return false; }
+
+    // Offer the uplink's DNS to the USB host (DHCP option 6), else it gets an IP
+    // but cannot resolve names. Must bounce the DHCP server to apply the option.
+    esp_netif_dns_info_t dns;
+    if (esp_netif_get_dns_info(sta, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK && dns.ip.u_addr.ip4.addr) {
+        esp_netif_dhcps_stop(s_netif);
+        uint8_t dns_offer = 0x02;  // OFFER_DNS: advertise the DNS set below
+        esp_netif_dhcps_option(s_netif, ESP_NETIF_OP_SET,
+                               ESP_NETIF_DOMAIN_NAME_SERVER, &dns_offer, sizeof(dns_offer));
+        esp_netif_set_dns_info(s_netif, ESP_NETIF_DNS_MAIN, &dns);
+        esp_netif_dhcps_start(s_netif);
+    }
+
+    esp_err_t en = esp_netif_napt_enable(s_netif);
+    if (en != ESP_OK) { snprintf(s_err, sizeof(s_err), "gw: napt %s", esp_err_to_name(en)); return false; }
+    s_napt = true;
+    ESP_LOGI(TAG, "USB-NCM gateway: NAPT on, sharing WiFi");
+    return true;
+}
+
+void usb_net_gateway_disable(void) {
+    if (s_napt && s_netif) { esp_netif_napt_disable(s_netif); s_napt = false; }
+}
+
 void usb_net_stop(void) {
     if (!s_up) return;
+    usb_net_gateway_disable();
     tinyusb_driver_uninstall();
     if (s_netif) {
         esp_netif_action_stop(s_netif, NULL, 0, NULL);

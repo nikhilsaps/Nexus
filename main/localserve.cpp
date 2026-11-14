@@ -10,6 +10,9 @@
 #include "safe_replace.h"
 #include "sniffer.h"
 #include "ble_hid.h"
+#include "usb_hid.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
@@ -618,6 +621,178 @@ static esp_err_t delete_handler(httpd_req_t* req) {
   return ESP_OK;
 }
 
+// ===================================================================
+// HID bridge: a WiFi web UI (phone) drives the USB-HID output (PC).
+// All same-origin GETs; each returns {"ok":true}. Keyboard uses the US
+// layout. Mouse/gamepad are raw pass-throughs to the TinyUSB reports.
+// ===================================================================
+#define KMOD_SHIFT 0x02
+
+// Map an ASCII char to a USB HID keyboard usage code + modifier bitmap.
+static bool ascii_to_hid(char c, uint8_t* mod, uint8_t* usage) {
+  *mod = 0; *usage = 0;
+  if (c >= 'a' && c <= 'z') { *usage = 0x04 + (c - 'a'); return true; }
+  if (c >= 'A' && c <= 'Z') { *mod = KMOD_SHIFT; *usage = 0x04 + (c - 'A'); return true; }
+  if (c >= '1' && c <= '9') { *usage = 0x1e + (c - '1'); return true; }
+  switch (c) {
+    case '0':  *usage = 0x27; return true;
+    case ' ':  *usage = 0x2c; return true;
+    case '\n': *usage = 0x28; return true;   // Enter
+    case '\t': *usage = 0x2b; return true;   // Tab
+    case '-':  *usage = 0x2d; return true;
+    case '=':  *usage = 0x2e; return true;
+    case '[':  *usage = 0x2f; return true;
+    case ']':  *usage = 0x30; return true;
+    case '\\': *usage = 0x31; return true;
+    case ';':  *usage = 0x33; return true;
+    case '\'': *usage = 0x34; return true;
+    case '`':  *usage = 0x35; return true;
+    case ',':  *usage = 0x36; return true;
+    case '.':  *usage = 0x37; return true;
+    case '/':  *usage = 0x38; return true;
+    case '!':  *mod = KMOD_SHIFT; *usage = 0x1e; return true;
+    case '@':  *mod = KMOD_SHIFT; *usage = 0x1f; return true;
+    case '#':  *mod = KMOD_SHIFT; *usage = 0x20; return true;
+    case '$':  *mod = KMOD_SHIFT; *usage = 0x21; return true;
+    case '%':  *mod = KMOD_SHIFT; *usage = 0x22; return true;
+    case '^':  *mod = KMOD_SHIFT; *usage = 0x23; return true;
+    case '&':  *mod = KMOD_SHIFT; *usage = 0x24; return true;
+    case '*':  *mod = KMOD_SHIFT; *usage = 0x25; return true;
+    case '(':  *mod = KMOD_SHIFT; *usage = 0x26; return true;
+    case ')':  *mod = KMOD_SHIFT; *usage = 0x27; return true;
+    case '_':  *mod = KMOD_SHIFT; *usage = 0x2d; return true;
+    case '+':  *mod = KMOD_SHIFT; *usage = 0x2e; return true;
+    case '{':  *mod = KMOD_SHIFT; *usage = 0x2f; return true;
+    case '}':  *mod = KMOD_SHIFT; *usage = 0x30; return true;
+    case '|':  *mod = KMOD_SHIFT; *usage = 0x31; return true;
+    case ':':  *mod = KMOD_SHIFT; *usage = 0x33; return true;
+    case '"':  *mod = KMOD_SHIFT; *usage = 0x34; return true;
+    case '~':  *mod = KMOD_SHIFT; *usage = 0x35; return true;
+    case '<':  *mod = KMOD_SHIFT; *usage = 0x36; return true;
+    case '>':  *mod = KMOD_SHIFT; *usage = 0x37; return true;
+    case '?':  *mod = KMOD_SHIFT; *usage = 0x38; return true;
+  }
+  return false;
+}
+
+// Named non-printable keys for /api/hid/key?name=...
+static bool named_key(const char* n, uint8_t* usage) {
+  if (!strcasecmp(n, "enter"))  { *usage = 0x28; return true; }
+  if (!strcasecmp(n, "esc"))    { *usage = 0x29; return true; }
+  if (!strcasecmp(n, "bksp") || !strcasecmp(n, "backspace")) { *usage = 0x2a; return true; }
+  if (!strcasecmp(n, "tab"))    { *usage = 0x2b; return true; }
+  if (!strcasecmp(n, "space"))  { *usage = 0x2c; return true; }
+  if (!strcasecmp(n, "del") || !strcasecmp(n, "delete")) { *usage = 0x4c; return true; }
+  if (!strcasecmp(n, "home"))   { *usage = 0x4a; return true; }
+  if (!strcasecmp(n, "end"))    { *usage = 0x4d; return true; }
+  if (!strcasecmp(n, "pgup"))   { *usage = 0x4b; return true; }
+  if (!strcasecmp(n, "pgdn"))   { *usage = 0x4e; return true; }
+  if (!strcasecmp(n, "right"))  { *usage = 0x4f; return true; }
+  if (!strcasecmp(n, "left"))   { *usage = 0x50; return true; }
+  if (!strcasecmp(n, "down"))   { *usage = 0x51; return true; }
+  if (!strcasecmp(n, "up"))     { *usage = 0x52; return true; }
+  return false;
+}
+
+// Press then release one key chord, giving TinyUSB time to flush each report.
+static void hid_tap(uint8_t mod, uint8_t usage) {
+  uint8_t keys[6] = { usage, 0, 0, 0, 0, 0 };
+  uhid_key_report(mod, keys);
+  vTaskDelay(pdMS_TO_TICKS(6));
+  uint8_t none[6] = { 0, 0, 0, 0, 0, 0 };
+  uhid_key_report(0, none);
+  vTaskDelay(pdMS_TO_TICKS(6));
+}
+
+static void hid_ok(httpd_req_t* req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+// Pull one query param into out[], %XX/+ decoded. false if the key is absent.
+static bool hid_qparam(httpd_req_t* req, const char* key, char* out, size_t cap) {
+  out[0] = 0;
+  size_t qlen = httpd_req_get_url_query_len(req) + 1;
+  if (qlen <= 1) return false;
+  if (qlen > 1500) qlen = 1500;
+  char* q = (char*)malloc(qlen);
+  if (!q) return false;
+  bool ok = false;
+  if (httpd_req_get_url_query_str(req, q, qlen) == ESP_OK &&
+      httpd_query_key_value(q, key, out, cap) == ESP_OK) {
+    ls_url_decode(out);
+    ok = true;
+  }
+  free(q);
+  return ok;
+}
+
+// GET /api/hid/type?t=<text> : type a US-layout ASCII string on the host.
+static esp_err_t hid_type_handler(httpd_req_t* req) {
+  g_ls_served = true;
+  if (!uhid_active()) { send_status_json(req, "503 Service Unavailable", "usb hid off"); return ESP_OK; }
+  char* t = (char*)malloc(1536);
+  if (!t) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_OK; }
+  if (hid_qparam(req, "t", t, 1536) && t[0]) {
+    for (const char* p = t; *p; p++) {
+      uint8_t mod, usage;
+      if (ascii_to_hid(*p, &mod, &usage)) hid_tap(mod, usage);
+    }
+  }
+  free(t);
+  hid_ok(req);
+  return ESP_OK;
+}
+
+// GET /api/hid/key?name=enter   OR   ?code=<usage>&mod=<modifier>
+static esp_err_t hid_key_handler(httpd_req_t* req) {
+  g_ls_served = true;
+  if (!uhid_active()) { send_status_json(req, "503 Service Unavailable", "usb hid off"); return ESP_OK; }
+  char name[24], code[8], mods[8];
+  uint8_t usage = 0, mod = 0;
+  if (hid_qparam(req, "name", name, sizeof name) && name[0]) {
+    if (!named_key(name, &usage)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad key"); return ESP_OK; }
+  } else if (hid_qparam(req, "code", code, sizeof code) && code[0]) {
+    usage = (uint8_t)strtol(code, NULL, 0);
+  } else {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "need name or code"); return ESP_OK;
+  }
+  if (hid_qparam(req, "mod", mods, sizeof mods) && mods[0]) mod = (uint8_t)strtol(mods, NULL, 0);
+  hid_tap(mod, usage);
+  hid_ok(req);
+  return ESP_OK;
+}
+
+// GET /api/hid/mouse?dx=&dy=&b=&w= : relative move / button bitmap / wheel.
+static esp_err_t hid_mouse_handler(httpd_req_t* req) {
+  g_ls_served = true;
+  if (!uhid_active()) { send_status_json(req, "503 Service Unavailable", "usb hid off"); return ESP_OK; }
+  char v[12];
+  int dx = 0, dy = 0, b = 0, w = 0;
+  if (hid_qparam(req, "dx", v, sizeof v)) dx = atoi(v);
+  if (hid_qparam(req, "dy", v, sizeof v)) dy = atoi(v);
+  if (hid_qparam(req, "b",  v, sizeof v)) b  = atoi(v);
+  if (hid_qparam(req, "w",  v, sizeof v)) w  = atoi(v);
+  uhid_send_mouse((uint8_t)b, (int8_t)dx, (int8_t)dy, (int8_t)w);
+  hid_ok(req);
+  return ESP_OK;
+}
+
+// GET /api/hid/pad?b=&x=&y= : gamepad 16-button bitmap + two axes (-127..127).
+static esp_err_t hid_pad_handler(httpd_req_t* req) {
+  g_ls_served = true;
+  if (!uhid_active()) { send_status_json(req, "503 Service Unavailable", "usb hid off"); return ESP_OK; }
+  char v[12];
+  int b = 0, x = 0, y = 0;
+  if (hid_qparam(req, "b", v, sizeof v)) b = atoi(v);
+  if (hid_qparam(req, "x", v, sizeof v)) x = atoi(v);
+  if (hid_qparam(req, "y", v, sizeof v)) y = atoi(v);
+  uhid_send_gamepad((uint16_t)b, (int8_t)x, (int8_t)y);
+  hid_ok(req);
+  return ESP_OK;
+}
+
 bool ls_http_start(void) {
   if (g_srv) return true;
   bhid_release();   // reclaim NimBLE host+controller heap if a BLE module ran
@@ -626,7 +801,7 @@ bool ls_http_start(void) {
   hc.uri_match_fn          = httpd_uri_match_wildcard;
   hc.stack_size            = 10240;   // FATFS/SPI + heap path bufs need headroom
   hc.lru_purge_enable      = true;
-  hc.max_uri_handlers      = 10;
+  hc.max_uri_handlers      = 16;
   hc.recv_wait_timeout     = 10;
   hc.send_wait_timeout     = 10;
   if (httpd_start(&g_srv, &hc) != ESP_OK) { g_srv = 0; return false; }
@@ -640,11 +815,15 @@ bool ls_http_start(void) {
   httpd_uri_t getall    = {}; getall.uri    = "/*";             getall.method    = HTTP_GET;  getall.handler    = get_handler;
   httpd_uri_t ls_get    = {}; ls_get.uri    = "/api/ls";        ls_get.method    = HTTP_GET;    ls_get.handler    = ls_handler;
   httpd_uri_t del       = {}; del.uri       = "/api/save/*";    del.method       = HTTP_DELETE; del.handler       = delete_handler;
+  httpd_uri_t hid_t     = {}; hid_t.uri     = "/api/hid/type";  hid_t.method     = HTTP_GET;    hid_t.handler     = hid_type_handler;
+  httpd_uri_t hid_k     = {}; hid_k.uri     = "/api/hid/key";   hid_k.method     = HTTP_GET;    hid_k.handler     = hid_key_handler;
+  httpd_uri_t hid_m     = {}; hid_m.uri     = "/api/hid/mouse"; hid_m.method     = HTTP_GET;    hid_m.handler     = hid_mouse_handler;
+  httpd_uri_t hid_p     = {}; hid_p.uri     = "/api/hid/pad";   hid_p.method     = HTTP_GET;    hid_p.handler     = hid_pad_handler;
 
   // The wildcard GET handler shadows everything, so a partially registered
   // server would silently serve 404s for /api/save instead of saving. Unwind
   // instead: a server that cannot route all four URIs must not come up.
-  const httpd_uri_t* uris[] = { &save_put, &save_post, &ls_get, &del, &sniff, &fetch, &fetch_p, &stat, &getall };
+  const httpd_uri_t* uris[] = { &save_put, &save_post, &ls_get, &del, &sniff, &fetch, &fetch_p, &stat, &hid_t, &hid_k, &hid_m, &hid_p, &getall };
   for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
     esp_err_t e = httpd_register_uri_handler(g_srv, uris[i]);
     if (e != ESP_OK) {

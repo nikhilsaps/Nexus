@@ -15,6 +15,8 @@ bool usb_net_start(void);   // install NCM + netif + DHCP server. false on fail.
 void usb_net_stop(void);    // tear USB-net down, free the PHY (idempotent).
 bool usb_net_running(void);
 void usb_net_ip(char* out, int cap);  // the host-facing URL host (192.168.7.1).
+bool usb_net_gateway_enable(void);    // NAPT + offer upstream DNS: share WiFi to the USB host.
+void usb_net_gateway_disable(void);   // drop NAPT (idempotent).
 const char* usb_net_last_err(void);   // which step failed + esp_err (diagnostic).
 
 #ifdef __cplusplus
