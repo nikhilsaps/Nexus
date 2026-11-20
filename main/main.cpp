@@ -2950,7 +2950,7 @@ extern "C" void app_main(void) {
   display.setBrightness(160);
   display.fillScreen(0);  // black out the physical strip left of the sprite (x<LMARGIN)
   init_palette();
-  canvas.setColorDepth(16);
+  canvas.setColorDepth(8);     // 8bpp/rgb332: ~32KB sprite vs 65KB at 16bpp (no images on UI)
   canvas.createSprite(W, H);   // grab the big contiguous block before BLE
 
   kb_init();

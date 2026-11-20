@@ -17,6 +17,10 @@ CONFIG_BT_NIMBLE_SVC_HID_MAX_INSTANCES=1
 CONFIG_TINYUSB_HID_COUNT=1
 # LocalServe Wired: USB-CDC-NCM network adapter (built-in Win11/macOS/Linux driver)
 CONFIG_TINYUSB_NET_MODE_NCM=y
+# NCM NTB buffers default to 3 in + 3 out x 3200B = ~19KB static .data. Drop to
+# 2 each (still double-buffered) to reclaim ~6.4KB; low-bandwidth NCM unaffected.
+CONFIG_TINYUSB_NCM_OUT_NTB_BUFFS_COUNT=2
+CONFIG_TINYUSB_NCM_IN_NTB_BUFFS_COUNT=2
 # FATFS long filenames for the microSD browser (Storage)
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255

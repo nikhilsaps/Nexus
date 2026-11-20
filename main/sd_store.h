@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define SD_MAX_ENTRIES 256
+#define SD_MAX_ENTRIES 128
 #define SD_NAME_MAX    80
 
 typedef struct {

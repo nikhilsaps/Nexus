@@ -2,6 +2,7 @@
 #include "sniffer.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_wifi.h"
@@ -185,7 +186,9 @@ int sniffer_json(char* buf, size_t len) {
   uint32_t now = now_ms();
 
   // Snapshot the table under the lock, then serialise outside it.
-  static dev_t snap[SNIFF_MAX];
+  // Heap-allocated (freed below) so the ~2.5KB snapshot is not permanent .bss.
+  dev_t* snap = (dev_t*)malloc(sizeof(dev_t) * SNIFF_MAX);
+  if (!snap) { if (cap > 0) buf[0] = 0; return 0; }
   int n;
   portENTER_CRITICAL(&g_mux);
   n = g_ndev;
@@ -208,5 +211,6 @@ int sniffer_json(char* buf, size_t len) {
   }
   if (o < cap - 2) { buf[o++] = ']'; buf[o++] = '}'; }
   buf[o] = 0;
+  free(snap);
   return o;
 }
